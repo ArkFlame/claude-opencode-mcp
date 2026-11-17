@@ -7,7 +7,7 @@ Thanks for your interest in `claude-opencode-mcp`! Full guidelines live in
 ## Quick start
 
 ```bash
-git clone https://github.com/putuandy/claude-opencode-mcp.git
+git clone https://github.com/ArkFlame/claude-opencode-mcp.git
 cd claude-opencode-mcp
 npm install
 npm run lint && npm run typecheck && npm test && npm run build

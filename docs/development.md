@@ -142,5 +142,5 @@ Versioning follows [Semantic Versioning](https://semver.org). For a release:
    from a GitHub Actions OIDC workflow). Requires npm 2FA.
 5. Push the tag and create the GitHub release from the changelog entry.
 6. Post-release: remove local tarballs and confirm the
-   [CI](https://github.com/putuandy/claude-opencode-mcp/actions) badge is
+   [CI](https://github.com/ArkFlame/claude-opencode-mcp/actions) badge is
    green.

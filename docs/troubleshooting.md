@@ -124,3 +124,30 @@ node dist/index.js --version
 
 When reporting a bug, include the `request_id` from the error payload and the
 matching lines from `bridge.log`.
+
+## Background runs (v1.2.0)
+
+**A run shows `stale`.** Its owner MCP process exited (restart, crash or kill -9) or it ran past
+the hard timeout plus 60 s. The reaper killed any surviving process group. Re-run the task, or
+inspect `log_path` from `get_run` first.
+
+**A run is `timeout` with "no output".** The idle watchdog fired. Raise `CLAUDE_OPENCODE_IDLE_TIMEOUT`
+(seconds) for slow model steps, or check the model with `list_models`.
+
+**A run is `failed` with "without a final reply".** The CLI exited with no assistant message even
+after one automatic retry. Read `log_tail` in `get_run`. Provider auth and quota errors appear there.
+
+**Queued forever.** All slots are busy. Call `list_runs` and `abort_all` on stale work, or raise
+`CLAUDE_OPENCODE_MAX_PARALLEL`. Two runs in one cwd also serialize unless `allow_shared_cwd=true`.
+
+**`Refusing to remove kab/<name>`.** The branch has commits not in the base. Land them, or call
+`remove_worktree` with `force=true` once they are no longer needed.
+
+**Model fell back.** The `model_note` says what was requested. Run `opencode models` and use an id
+from that list.
+
+**A run cannot read a read_paths directory.** Those paths are outside the worktree. Confirm
+`security.externalDirectory` allows them, or copy the reference material into the worktree.
+
+**Commits are denied for a worker.** The default policy sets `security.denyGitCommit`. Workers that
+must commit need that setting turned off in your configuration.

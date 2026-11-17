@@ -113,3 +113,52 @@ listed in [troubleshooting.md](troubleshooting.md#error-codes) and in
 
 No state is written into the repository except what `init` creates inside
 `.claude-opencode/`.
+
+## Background runs and the stale-agent design (v1.2.0)
+
+`delegate_task` no longer waits on a long-lived OpenCode server. Each call starts one
+`opencode run --standalone --format json --auto` child that the bridge owns:
+
+- **Process group.** The child is spawned `detached`, so its pid is also its process-group id.
+  Every kill goes to `-pgid`, which also reaches standalone servers and grandchildren.
+- **Watchdogs** (`src/runs/attempt.ts`). A hard timeout (`CLAUDE_OPENCODE_TIMEOUT`, default
+  1500 s) and an idle watchdog (`CLAUDE_OPENCODE_IDLE_TIMEOUT`, default 300 s without stdout or
+  stderr). Ending an attempt sends SIGTERM to the group and SIGKILL 3 s later. When the leader
+  exits, leftovers in the group get the same treatment.
+- **Retry.** A run that exits without a final assistant message is retried once. Timeouts and
+  aborts are never retried.
+- **Records** (`src/runs/store.ts`). One JSON file per run in `~/.cache/claude-opencode-mcp/runs`
+  (override `CLAUDE_OPENCODE_RUNS_DIR`), written atomically. Each record holds pid, pgid,
+  owner_pid, cwd, started, last_activity, status, exit code and the bounded final reply. Logs
+  and prompts sit next to it. Status survives MCP restarts.
+- **Reaper** (`RunManager.reapStale`). Runs at startup and every 60 s. A non-terminal record is
+  reaped when its owner process is gone or it has run past timeout plus 60 s. Reaping kills the
+  group only when `/proc/<pid>/cmdline` still names opencode, which guards against pid reuse.
+  Reaped records end as `stale`.
+- **Shutdown.** SIGINT, SIGTERM and transport close abort every run. The `exit` hook sends
+  SIGKILL to each tracked group, so no child outlives the MCP process.
+
+### Queueing and worktrees
+
+- At most `CLAUDE_OPENCODE_MAX_PARALLEL` runs (default 10) execute at once. Extra starts queue
+  FIFO. A run whose cwd is already in use waits unless `allow_shared_cwd` is set.
+- `create_worktree` and `remove_worktree` run git through `execFile` with argv arrays, under one
+  process-wide lock. Names must match `^[a-z0-9][a-z0-9._-]{0,60}$`. `remove_worktree` refuses
+  while `git cherry <base> <branch>` reports commits that are not in the base, unless `force`.
+
+### Models and briefs
+
+- `opencode models` is parsed and cached for five minutes. A requested model that is not listed
+  falls back to the configured default (`opencode/hy4-flash-free`), and the result carries a
+  `model_note`.
+- The worker header is configurable through `runs.briefHeaderFile` or
+  `CLAUDE_OPENCODE_BRIEF_HEADER`. The built-in header is generic.
+- Per-call agent grants (`allow_edits`, `allow_bash`) still map onto the same variant agents and
+  permission profiles as before (`src/runs/agent-config.ts`). Per-agent model pins are dropped
+  so the run model is the one selected per call.
+
+### Output
+
+Final replies are ANSI-stripped and capped at 16 KB, with `log_path` for the full log.
+`get_run` returns a structured summary: parsed `Status:`, commit hash and test lines.
+Worker output is untrusted data.

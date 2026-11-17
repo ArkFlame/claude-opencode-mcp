@@ -86,3 +86,24 @@ project directory with no initialization.
 
 - [Claude Code setup](claude-code-setup.md)
 - [Configuration](configuration.md)
+
+## Register as a native Claude Code MCP server (recommended)
+
+Run the bundled installer from the repository. It builds the bridge and registers it at user scope
+under the name `claude-opencode`. It is idempotent, so re-running it replaces the entry:
+
+```bash
+git clone https://github.com/ArkFlame/claude-opencode-mcp.git
+cd claude-opencode-mcp
+scripts/install.sh            # or: scripts/install.sh <server-name>
+claude mcp get claude-opencode
+```
+
+Under the hood the script runs `npm ci --ignore-scripts` (only when `node_modules` is missing),
+`npm run build`, then:
+
+```bash
+claude mcp add --scope user claude-opencode -- node /absolute/path/to/claude-opencode-mcp/dist/index.js
+```
+
+The repository location is the install location. Rebuild with `npm run build` after pulling.

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-17
+### Added
+- Background CLI runs. `delegate_task` returns a `run_id` immediately, with a hard timeout (`CLAUDE_OPENCODE_TIMEOUT`), an idle watchdog (`CLAUDE_OPENCODE_IDLE_TIMEOUT`), and SIGTERM then SIGKILL on the whole process group.
+- One automatic retry when a run ends without a final reply.
+- Persistent run records, plus a reaper at startup and every 60 s that marks orphaned runs `stale`.
+- Tools: `list_runs`, `get_run`, `wait_any`, `abort_run`, `abort_all`, `list_models`, `create_worktree`, `remove_worktree`.
+- Per-call `model` with fallback to the configured default when the model is not listed. `CLAUDE_OPENCODE_MODEL` sets the default.
+- FIFO queue bounded by `CLAUDE_OPENCODE_MAX_PARALLEL` (default 10), with one run per cwd unless `allow_shared_cwd`.
+- Worker brief header (`brief`, `header`, `read_paths`), configurable via `CLAUDE_OPENCODE_BRIEF_HEADER`.
+- `scripts/install.sh` registers the server with `claude mcp add --scope user`.
+- Unit and integration tests for names, output bounds, model fallback, the watchdog, FIFO queueing, worktree refusal and the MCP tool surface.
+
+### Changed
+- `delegate_task` runs through the `opencode` CLI instead of a shared server. Its input changed: `agent`, `cwd`, `allow_edits` and `allow_bash` keep their meaning, `timeout` is now `timeout_seconds`, and `paths` is replaced by `read_paths`.
+- Session tools (`create_session`, `send_message`, `get_session`, `get_diff`, `abort_session`) are unchanged.
+
+### Fixed
+- `package.json` repository, homepage and bugs URLs point at ArkFlame/claude-opencode-mcp.
+- Runtime dependencies `@modelcontextprotocol/sdk` (1.32.2), `zod` (4.6.7) and `body-parser` (2.4.0, via override) move past their high-severity advisories.
+
 ## [1.1.0] - 2026-09-30
 
 ### Added
@@ -81,6 +101,7 @@ First stable release.
 - CI across Node 20/22/24 (Ubuntu) and Node 24 (macOS), plus an opt-in,
   push-only real-provider E2E job.
 
-[Unreleased]: https://github.com/putuandy/claude-opencode-mcp/compare/v1.1.0...HEAD
-[1.1.0]: https://github.com/putuandy/claude-opencode-mcp/compare/v1.0.0...v1.1.0
-[1.0.0]: https://github.com/putuandy/claude-opencode-mcp/releases/tag/v1.0.0
+[Unreleased]: https://github.com/ArkFlame/claude-opencode-mcp/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/ArkFlame/claude-opencode-mcp/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/ArkFlame/claude-opencode-mcp/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/ArkFlame/claude-opencode-mcp/releases/tag/v1.0.0

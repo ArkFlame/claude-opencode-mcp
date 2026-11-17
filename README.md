@@ -1,6 +1,6 @@
 # claude-opencode-mcp
 
-[![CI](https://github.com/putuandy/claude-opencode-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/putuandy/claude-opencode-mcp/actions/workflows/ci.yml)
+[![CI](https://github.com/ArkFlame/claude-opencode-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/ArkFlame/claude-opencode-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](https://nodejs.org)
 
@@ -91,7 +91,7 @@ The bridge can also use an OpenCode installation from `PATH`, from
 ### From source
 
 ```bash
-git clone https://github.com/putuandy/claude-opencode-mcp.git
+git clone https://github.com/ArkFlame/claude-opencode-mcp.git
 cd claude-opencode-mcp
 npm install
 npm run build
@@ -531,3 +531,35 @@ Bug reports, feature requests, and pull requests are welcome. Start with
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Background runs (v1.2.0)
+
+`delegate_task` now starts a background `opencode run` and returns a `run_id` at once. Use
+`wait_any` to block on the first finished run and `get_run` for its result. Runs have a hard
+timeout and an idle watchdog. Each run is killed with its whole process group. Records persist
+across MCP restarts, and orphaned runs are reaped at startup.
+
+| Tool | Purpose |
+| --- | --- |
+| `delegate_task` | Start a run: `task`, `brief`, `cwd`, `model`, `agent`, `read_paths`, `allow_edits`, `allow_bash`, `allow_shared_cwd`, `wait_seconds` (<= 110) |
+| `list_runs` | Status, age, idle seconds, cwd, branch, last log line, one-line summary |
+| `get_run` | Final reply (16 KB cap), parsed `Status:`/commit/tests, log tail, git diff stat |
+| `wait_any` | Block up to N seconds (<= 110) until any listed run finishes |
+| `abort_run` / `abort_all` | Stop one run or all runs, then reap stale records |
+| `list_models` | Models from `opencode models`, cached five minutes |
+| `create_worktree` / `remove_worktree` | `<repo>-wt/<name>` on branch `kab/<name>`; removal refuses unlanded commits unless `force` |
+
+Environment variables (env overrides `config.json` values in the `runs` section):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CLAUDE_OPENCODE_MODEL` | `opencode/hy4-flash-free` | Default run model (`provider/model`) |
+| `CLAUDE_OPENCODE_TIMEOUT` | `1500` | Hard timeout per run, seconds |
+| `CLAUDE_OPENCODE_IDLE_TIMEOUT` | `300` | Kill after this many seconds without output |
+| `CLAUDE_OPENCODE_MAX_PARALLEL` | `10` | Concurrent runs; extra runs queue FIFO |
+| `CLAUDE_OPENCODE_ALLOWED_ROOTS` | parent of the repo | Path-delimiter-separated roots runs may use |
+| `CLAUDE_OPENCODE_BRIEF_HEADER` | built-in header | File whose text prepends every brief |
+| `CLAUDE_OPENCODE_RUNS_DIR` | `~/.cache/claude-opencode-mcp/runs` | Run records, logs and prompts |
+| `CLAUDE_OPENCODE_BIN` | `opencode` | OpenCode executable |
+
+Install as a Claude Code server with `scripts/install.sh`. See `docs/installation.md`.
