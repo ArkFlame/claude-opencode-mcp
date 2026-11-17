@@ -131,7 +131,7 @@ describe("delegate_task and run tracking", () => {
     expect(data.status).toBe("done");
     expect(data.result.final.status_line).toBe("PASS");
     expect(data.result.final.commit).toBe("1234abc");
-    expect(data.model).toBe("opencode/hy4-flash-free");
+    expect(data.model).toBe("opencode-go/hy4-flash-free");
 
     const listed = await call("list_runs", {});
     expect(listed.data.runs.map((row: { run_id: string }) => row.run_id)).toContain(data.run_id);
@@ -149,7 +149,7 @@ describe("delegate_task and run tracking", () => {
       model: "nope/missing",
       wait_seconds: 30,
     });
-    expect(data.model).toBe("opencode/hy4-flash-free");
+    expect(data.model).toBe("opencode-go/hy4-flash-free");
     expect(data.model_note).toContain("fell back");
   });
 
@@ -167,7 +167,7 @@ describe("delegate_task and run tracking", () => {
   it("lists models from the CLI", async () => {
     const { data } = await call("list_models", { refresh: true });
     expect(data.available).toBe(true);
-    expect(data.models).toEqual(["opencode/hy4-flash-free", "opencode/other-model"]);
+    expect(data.models).toEqual(["opencode-go/hy4-flash-free", "opencode-go/other-model"]);
   });
 
   it("wait_any reports unknown ids and returns finished runs without busy-polling", async () => {
