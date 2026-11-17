@@ -38,7 +38,7 @@ describe("run names", () => {
   });
 
   it("requires provider/model shape", () => {
-    expect(assertModelId("opencode/hy4-flash-free")).toBe("opencode/hy4-flash-free");
+    expect(assertModelId("opencode-go/hy4-flash-free")).toBe("opencode-go/hy4-flash-free");
     expect(() => assertModelId("bad model")).toThrow();
   });
 });
@@ -79,18 +79,18 @@ describe("model selection", () => {
   });
 
   it("falls back to the default when the requested model is not listed", () => {
-    const listed = ["opencode/hy4-flash-free", "commandcode/deepseek-v4-pro"];
-    const fallback = resolveRunModel("nope/missing", "opencode/hy4-flash-free", listed);
-    expect(fallback.model).toBe("opencode/hy4-flash-free");
+    const listed = ["opencode-go/hy4-flash-free", "commandcode/deepseek-v4-pro"];
+    const fallback = resolveRunModel("nope/missing", "opencode-go/hy4-flash-free", listed);
+    expect(fallback.model).toBe("opencode-go/hy4-flash-free");
     expect(fallback.note).toContain("fell back");
-    expect(resolveRunModel("deepseek-v4-pro", "opencode/hy4-flash-free", listed).model).toBe(
+    expect(resolveRunModel("deepseek-v4-pro", "opencode-go/hy4-flash-free", listed).model).toBe(
       "commandcode/deepseek-v4-pro",
     );
-    expect(resolveRunModel(null, "opencode/hy4-flash-free", listed).note).toBeNull();
+    expect(resolveRunModel(null, "opencode-go/hy4-flash-free", listed).note).toBeNull();
   });
 
   it("uses the requested model as given when the list is unavailable", () => {
-    expect(resolveRunModel("x/y", "opencode/hy4-flash-free", null)).toEqual({
+    expect(resolveRunModel("x/y", "opencode-go/hy4-flash-free", null)).toEqual({
       model: "x/y",
       note: "model list unavailable; used as given",
     });
@@ -106,7 +106,7 @@ describe("run record lifecycle", () => {
       cwd: "/tmp",
       branch: null,
       agent: null,
-      model: "opencode/hy4-flash-free",
+      model: "opencode-go/hy4-flash-free",
       model_note: null,
       allow_shared_cwd: false,
       attempts: 0,
@@ -159,7 +159,7 @@ describe("run record lifecycle", () => {
 
   it("builds argv without a shell and keeps the prompt in a file", () => {
     const args = buildRunArgs({
-      model: "opencode/hy4-flash-free",
+      model: "opencode-go/hy4-flash-free",
       agent: "deepseek-coder__edit",
       title: "t",
       promptFile: "/tmp/p.md",
@@ -171,7 +171,7 @@ describe("run record lifecycle", () => {
       "json",
       "--auto",
       "-m",
-      "opencode/hy4-flash-free",
+      "opencode-go/hy4-flash-free",
     ]);
     expect(args).toContain("--file");
     expect(args.at(-2)).toBe("--");

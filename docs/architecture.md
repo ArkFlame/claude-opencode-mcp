@@ -149,7 +149,7 @@ No state is written into the repository except what `init` creates inside
 ### Models and briefs
 
 - `opencode models` is parsed and cached for five minutes. A requested model that is not listed
-  falls back to the configured default (`opencode/hy4-flash-free`), and the result carries a
+  falls back to the configured default (`opencode-go/hy4-flash-free`), and the result carries a
   `model_note`.
 - The worker header is configurable through `runs.briefHeaderFile` or
   `CLAUDE_OPENCODE_BRIEF_HEADER`. The built-in header is generic.

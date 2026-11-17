@@ -553,7 +553,7 @@ Environment variables (env overrides `config.json` values in the `runs` section)
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `CLAUDE_OPENCODE_MODEL` | `opencode/hy4-flash-free` | Default run model (`provider/model`) |
+| `CLAUDE_OPENCODE_MODEL` | `opencode-go/hy4-flash-free` | Default run model (`provider/model`) |
 | `CLAUDE_OPENCODE_TIMEOUT` | `1500` | Hard timeout per run, seconds |
 | `CLAUDE_OPENCODE_IDLE_TIMEOUT` | `300` | Kill after this many seconds without output |
 | `CLAUDE_OPENCODE_MAX_PARALLEL` | `10` | Concurrent runs; extra runs queue FIFO |

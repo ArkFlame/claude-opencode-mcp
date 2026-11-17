@@ -7,7 +7,7 @@ import fs from "node:fs";
 
 const args = process.argv.slice(2);
 if (args[0] === "models") {
-  process.stdout.write("opencode/hy4-flash-free\nopencode/other-model\n");
+  process.stdout.write("opencode-go/hy4-flash-free\nopencode/other-model\n");
   process.exit(0);
 }
 

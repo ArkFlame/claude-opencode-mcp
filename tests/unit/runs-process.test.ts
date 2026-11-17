@@ -131,7 +131,7 @@ describe("RunManager queue", () => {
       branch: null,
       agent: null,
       agentConfig: null,
-      model: "opencode/hy4-flash-free",
+      model: "opencode-go/hy4-flash-free",
       modelNote: null,
       allowSharedCwd: false,
       timeoutMs: 30_000,

@@ -75,7 +75,7 @@ export const BridgeConfigSchema = z.object({
   runs: z
     .object({
       /** Default model for runs, `provider/model`. Env: CLAUDE_OPENCODE_MODEL. */
-      model: z.string().default("opencode/hy4-flash-free"),
+      model: z.string().default("opencode-go/hy4-flash-free"),
       /** Default agent for runs. */
       agent: z.string().default("deepseek-coder"),
       /** Hard wall-clock limit per run. Env: CLAUDE_OPENCODE_TIMEOUT. */

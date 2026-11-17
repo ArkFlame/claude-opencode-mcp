@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { assertModelId } from "./names.js";
 
-export const DEFAULT_RUN_MODEL = "opencode/hy4-flash-free";
+export const DEFAULT_RUN_MODEL = "opencode-go/hy4-flash-free";
 const MODEL_LIST_TTL_MS = 5 * 60_000;
 const MODEL_LIST_TIMEOUT_MS = 60_000;
 
