@@ -1,0 +1,459 @@
+import { randomBytes } from "node:crypto";
+import { EventEmitter } from "node:events";
+import fs from "node:fs";
+import path from "node:path";
+import type { Logger } from "../util/logger.js";
+import { type AttemptResult, KILL_GRACE_MS, runAttempt } from "./attempt.js";
+import type { RunSettings } from "./settings.js";
+import {
+  isProcessAlive,
+  isTerminal,
+  killProcessGroup,
+  looksLikeOpencode,
+  type RunRecord,
+  type RunStatus,
+  type RunStore,
+} from "./store.js";
+
+/** A run may outlive its own deadline by this much before the reaper treats it as stuck. */
+const REAP_MARGIN_MS = 60_000;
+const REAP_INTERVAL_MS = 60_000;
+const PERSIST_THROTTLE_MS = 5_000;
+const WAIT_TICK_MS = 2_000;
+
+export interface SubmitInput {
+  name: string;
+  prompt: string;
+  cwd: string;
+  branch: string | null;
+  agent: string | null;
+  agentConfig: string | null;
+  model: string;
+  modelNote: string | null;
+  allowSharedCwd: boolean;
+  timeoutMs: number;
+  idleMs: number;
+}
+
+interface Job {
+  record: RunRecord;
+  input: SubmitInput;
+  abort: AbortController;
+  lastPersist: number;
+}
+
+export interface RunManagerOptions {
+  store: RunStore;
+  settings: Pick<RunSettings, "binary" | "maxParallel" | "retry" | "timeoutMs">;
+  logger: Logger;
+  ownerPid?: number;
+}
+
+export function newRunId(): string {
+  return `${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`;
+}
+
+/** Argument vector for `opencode run`. No shell: every value is one argv entry. */
+export function buildRunArgs(input: {
+  model: string;
+  agent: string | null;
+  title: string;
+  promptFile: string;
+}): string[] {
+  const args = ["run", "--standalone", "--format", "json", "--auto", "-m", input.model];
+  if (input.agent) args.push("--agent", input.agent);
+  args.push(
+    "--title",
+    input.title.slice(0, 120),
+    "--file",
+    input.promptFile,
+    "--",
+    "Carry out the attached task brief exactly as written.",
+  );
+  return args;
+}
+
+export function summaryLine(records: RunRecord[], maxParallel: number): string {
+  const counts: Record<string, number> = {};
+  for (const record of records) counts[record.status] = (counts[record.status] ?? 0) + 1;
+  const order: RunStatus[] = ["running", "queued", "done", "failed", "timeout", "stale", "aborted"];
+  const parts = order
+    .filter((status) => counts[status])
+    .map((status) => `${counts[status]} ${status}`);
+  return `${parts.join(", ") || "no runs"} (max parallel ${maxParallel})`;
+}
+
+export class RunManager {
+  private readonly active = new Map<string, Job>();
+  private queue: Job[] = [];
+  private readonly events = new EventEmitter();
+  private readonly ownerPid: number;
+  private reaper: NodeJS.Timeout | null = null;
+  private stopping = false;
+
+  constructor(private readonly options: RunManagerOptions) {
+    this.ownerPid = options.ownerPid ?? process.pid;
+    this.events.setMaxListeners(200);
+  }
+
+  get store(): RunStore {
+    return this.options.store;
+  }
+
+  get maxParallel(): number {
+    return this.options.settings.maxParallel;
+  }
+
+  get settings(): RunManagerOptions["settings"] {
+    return this.options.settings;
+  }
+
+  /** Reap leftovers from earlier processes and start the periodic reaper. */
+  start(): void {
+    this.reapStale();
+    if (!this.reaper) {
+      this.reaper = setInterval(() => this.reapStale(), REAP_INTERVAL_MS);
+      this.reaper.unref();
+    }
+  }
+
+  submit(input: SubmitInput): RunRecord {
+    if (this.stopping) {
+      throw new Error("the run manager is shutting down");
+    }
+    const id = newRunId();
+    const dir = this.store.dir;
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const promptFile = path.join(dir, `${id}.prompt.md`);
+    fs.writeFileSync(promptFile, input.prompt, { mode: 0o600 });
+    const record: RunRecord = {
+      id,
+      name: input.name,
+      status: "queued",
+      cwd: input.cwd,
+      branch: input.branch,
+      agent: input.agent,
+      model: input.model,
+      model_note: input.modelNote,
+      allow_shared_cwd: input.allowSharedCwd,
+      attempts: 0,
+      owner_pid: this.ownerPid,
+      pid: null,
+      pgid: null,
+      created: Date.now(),
+      started: null,
+      finished: null,
+      last_activity: Date.now(),
+      exit_code: null,
+      signal: null,
+      final_text: null,
+      final_truncated: false,
+      last_line: null,
+      error: null,
+      prompt_file: promptFile,
+      log_file: path.join(dir, `${id}.log`),
+    };
+    this.store.save(record);
+    this.queue.push({ record, input, abort: new AbortController(), lastPersist: 0 });
+    this.pump();
+    return this.store.get(id) ?? record;
+  }
+
+  /** 1-based queue position, or 0 when the run is not queued. */
+  queuePosition(id: string): number {
+    const index = this.queue.findIndex((job) => job.record.id === id);
+    return index < 0 ? 0 : index + 1;
+  }
+
+  activeCount(): number {
+    return this.active.size;
+  }
+
+  queuedCount(): number {
+    return this.queue.length;
+  }
+
+  private canStart(job: Job): boolean {
+    if (job.input.allowSharedCwd) return true;
+    for (const active of this.active.values()) {
+      if (active.input.cwd === job.input.cwd) return false;
+    }
+    return true;
+  }
+
+  private pump(): void {
+    while (this.active.size < this.options.settings.maxParallel) {
+      const index = this.queue.findIndex((job) => this.canStart(job));
+      if (index < 0) return;
+      const [job] = this.queue.splice(index, 1);
+      if (!job) return;
+      this.active.set(job.record.id, job);
+      void this.execute(job);
+    }
+  }
+
+  private persist(record: RunRecord): void {
+    try {
+      this.store.save(record);
+    } catch (error) {
+      this.options.logger.warn("failed to persist run record", {
+        run_id: record.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private async execute(job: Job): Promise<void> {
+    const { record, input } = job;
+    const maxAttempts = this.options.settings.retry ? 2 : 1;
+    let result: AttemptResult | null = null;
+    try {
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        record.attempts = attempt;
+        record.status = "running";
+        record.started = Date.now();
+        record.last_activity = record.started;
+        record.pid = null;
+        record.pgid = null;
+        record.error = null;
+        this.persist(record);
+        const env: NodeJS.ProcessEnv = { ...process.env };
+        if (input.agentConfig) env.OPENCODE_CONFIG_CONTENT = input.agentConfig;
+        result = await runAttempt(
+          {
+            command: this.options.settings.binary,
+            args: buildRunArgs({
+              model: input.model,
+              agent: input.agent,
+              title: `${input.name} (${record.id})`,
+              promptFile: record.prompt_file,
+            }),
+            cwd: input.cwd,
+            env,
+            logFile: record.log_file,
+          },
+          { timeoutMs: input.timeoutMs, idleMs: input.idleMs },
+          {
+            onSpawn: (pid) => {
+              record.pid = pid;
+              record.pgid = pid;
+              this.persist(record);
+            },
+            onActivity: (line, at) => {
+              record.last_activity = at;
+              if (line) record.last_line = line;
+              if (at - job.lastPersist >= PERSIST_THROTTLE_MS) {
+                job.lastPersist = at;
+                this.persist(record);
+              }
+            },
+          },
+          job.abort.signal,
+        );
+        if (job.abort.signal.aborted || result.end !== "exit" || result.text) break;
+        this.options.logger.warn("run ended without a final reply", {
+          run_id: record.id,
+          attempt,
+          exit_code: result.exitCode,
+        });
+      }
+    } catch (error) {
+      result = {
+        end: "spawn-error",
+        exitCode: null,
+        signal: null,
+        text: "",
+        errorMessage: error instanceof Error ? error.message : String(error),
+        lastLine: null,
+        pid: null,
+        pgid: null,
+      };
+    }
+    this.finalize(job, result);
+  }
+
+  private finalize(job: Job, result: AttemptResult | null): void {
+    const { record, input } = job;
+    const end = result?.end ?? "spawn-error";
+    let status: RunStatus;
+    if (job.abort.signal.aborted) status = "aborted";
+    else if (end === "timeout" || end === "idle") status = "timeout";
+    else if (end === "exit" && result?.text && result.exitCode === 0) status = "done";
+    else status = "failed";
+
+    record.status = status;
+    record.finished = Date.now();
+    record.pid = null;
+    record.pgid = null;
+    record.exit_code = result?.exitCode ?? null;
+    record.signal = result?.signal ?? null;
+    record.final_text = result?.text ? result.text : null;
+    record.final_truncated = (result?.text.length ?? 0) > 256 * 1024;
+    if (result?.lastLine) record.last_line = result.lastLine;
+    if (status === "aborted") record.error = "aborted";
+    else if (end === "timeout")
+      record.error = `hard timeout after ${Math.round(input.timeoutMs / 1000)}s`;
+    else if (end === "idle") record.error = `no output for ${Math.round(input.idleMs / 1000)}s`;
+    else if (status === "failed")
+      record.error = result?.errorMessage ?? "run ended without a final reply";
+    this.persist(record);
+    this.active.delete(record.id);
+    this.options.logger.info("run finished", {
+      run_id: record.id,
+      status,
+      attempts: record.attempts,
+    });
+    this.events.emit("finished", record.id);
+    this.pump();
+  }
+
+  /** Abort one run. Queued runs are dropped; active runs get SIGTERM then SIGKILL. */
+  abort(id: string): RunRecord | null {
+    const queuedIndex = this.queue.findIndex((job) => job.record.id === id);
+    if (queuedIndex >= 0) {
+      const [job] = this.queue.splice(queuedIndex, 1);
+      if (job) {
+        job.record.status = "aborted";
+        job.record.error = "aborted before start";
+        job.record.finished = Date.now();
+        this.persist(job.record);
+        this.events.emit("finished", id);
+      }
+      return this.store.get(id);
+    }
+    const job = this.active.get(id);
+    if (job) {
+      job.abort.abort();
+      return this.store.get(id);
+    }
+    const stored = this.store.get(id);
+    if (stored && !isTerminal(stored.status)) {
+      this.reapRecord(stored, "aborted by request", "aborted");
+      this.events.emit("finished", id);
+      return this.store.get(id);
+    }
+    return stored;
+  }
+
+  abortAll(): { queued: number; running: number; reaped: number } {
+    const queued = this.queue.length;
+    for (const job of [...this.queue]) this.abort(job.record.id);
+    const running = this.active.size;
+    for (const id of [...this.active.keys()]) this.abort(id);
+    let reaped = 0;
+    for (const record of this.store.list()) {
+      if (!isTerminal(record.status) && !this.active.has(record.id)) {
+        this.abort(record.id);
+        reaped += 1;
+      }
+    }
+    return { queued, running, reaped };
+  }
+
+  /** Mark orphaned or overdue runs stale and kill their process groups. Returns the count. */
+  reapStale(now = Date.now()): number {
+    let count = 0;
+    const hardLimit = this.options.settings.timeoutMs + REAP_MARGIN_MS;
+    for (const record of this.store.list()) {
+      if (isTerminal(record.status) || this.active.has(record.id)) continue;
+      const ownerGone = record.owner_pid === this.ownerPid || !isProcessAlive(record.owner_pid);
+      const overdue = record.started !== null && now - record.started > hardLimit;
+      if (!ownerGone && !overdue && record.status !== "queued") continue;
+      const reason = ownerGone
+        ? "owner process exited; run reaped"
+        : "exceeded hard timeout; run reaped";
+      this.reapRecord(record, reason, "stale");
+      count += 1;
+    }
+    if (count > 0) this.options.logger.info("reaped stale runs", { count });
+    return count;
+  }
+
+  private reapRecord(record: RunRecord, reason: string, status: RunStatus): void {
+    const pgid = record.pgid ?? record.pid;
+    if (pgid && isProcessAlive(pgid) && looksLikeOpencode(pgid)) {
+      killProcessGroup(pgid, "SIGTERM");
+      const timer = setTimeout(() => killProcessGroup(pgid, "SIGKILL"), KILL_GRACE_MS);
+      timer.unref();
+    }
+    record.status = status;
+    record.error = reason;
+    record.finished = Date.now();
+    record.pid = null;
+    record.pgid = null;
+    this.persist(record);
+    this.events.emit("finished", record.id);
+  }
+
+  /** Wait until this process has no active runs (after abort), bounded by `ms`. */
+  async waitForActive(ms: number): Promise<boolean> {
+    const deadline = Date.now() + ms;
+    while (this.active.size > 0 && Date.now() < deadline) {
+      await this.nextEvent(Math.min(WAIT_TICK_MS, deadline - Date.now()));
+    }
+    return this.active.size === 0;
+  }
+
+  /** Wait until any listed run is terminal, or until `seconds` elapse. Never busy-polls. */
+  async waitAny(
+    ids: string[],
+    seconds: number,
+  ): Promise<{ finished: RunRecord[]; pending: string[]; unknown: string[]; timed_out: boolean }> {
+    const deadline = Date.now() + seconds * 1000;
+    for (;;) {
+      const snapshot = this.collect(ids);
+      const done = snapshot.finished.length > 0 || snapshot.pending.length === 0;
+      if (done || Date.now() >= deadline) {
+        return { ...snapshot, timed_out: !done };
+      }
+      await this.nextEvent(Math.min(WAIT_TICK_MS, deadline - Date.now()));
+    }
+  }
+
+  private collect(ids: string[]): { finished: RunRecord[]; pending: string[]; unknown: string[] } {
+    const finished: RunRecord[] = [];
+    const pending: string[] = [];
+    const unknown: string[] = [];
+    for (const id of ids) {
+      const record = this.store.get(id);
+      if (!record) unknown.push(id);
+      else if (isTerminal(record.status)) finished.push(record);
+      else pending.push(id);
+    }
+    return { finished, pending, unknown };
+  }
+
+  private nextEvent(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        this.events.off("finished", done);
+        resolve();
+      };
+      const timer = setTimeout(done, ms);
+      this.events.on("finished", done);
+    });
+  }
+
+  /** Stop accepting work, abort everything in flight. Child processes die with the group. */
+  async shutdown(): Promise<void> {
+    this.stopping = true;
+    if (this.reaper) clearInterval(this.reaper);
+    for (const job of this.queue.splice(0)) this.abort(job.record.id);
+    for (const id of this.active.keys()) this.abort(id);
+  }
+
+  /** Synchronous last resort for process `exit`: SIGKILL every group this process started. */
+  killAllSync(): void {
+    for (const job of this.active.values()) {
+      const pgid = job.record.pgid;
+      if (pgid) killProcessGroup(pgid, "SIGKILL");
+      job.record.status = "aborted";
+      job.record.error = "server shut down";
+      job.record.finished = Date.now();
+      job.record.pid = null;
+      job.record.pgid = null;
+      this.persist(job.record);
+    }
+  }
+}

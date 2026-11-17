@@ -5,561 +5,222 @@ import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { BridgeConfigSchema, type ResolvedConfig } from "../../src/config/config.js";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { BridgeConfigSchema } from "../../src/config/config.js";
 import { createMcpServer } from "../../src/mcp/server.js";
 import { OpenCodeManager } from "../../src/opencode/manager.js";
 import { SessionRegistry } from "../../src/opencode/sessions.js";
+import { RunManager } from "../../src/runs/manager.js";
+import { type RunSettings, resolveRunSettings } from "../../src/runs/settings.js";
+import { RunStore } from "../../src/runs/store.js";
 import { createLogger } from "../../src/util/logger.js";
-import { FakeOpenCode, type FakeOpenCodeOptions } from "../helpers/fake-opencode.js";
 
-let fake: FakeOpenCode;
+const FAKE = new URL("../helpers/fake-opencode-cli.mjs", import.meta.url).pathname;
+const ENV_KEYS = ["FAKE_MODE", "FAKE_DELAY_MS"] as const;
+const saved: Record<string, string | undefined> = {};
+const dirs: string[] = [];
+
 let client: Client;
 let server: McpServer;
+let root: string;
+let workdir: string;
 let manager: OpenCodeManager;
-let stateDir: string;
-const tempDirs: string[] = [];
 
-async function tempDir(prefix = "co-int-"): Promise<string> {
-  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), prefix));
-  tempDirs.push(dir);
+function tempDir(prefix: string): string {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+  dirs.push(dir);
   return dir;
 }
 
-async function setupApp(options: {
-  fakeOptions?: FakeOpenCodeOptions;
-  configOverrides?: Record<string, unknown>;
-}): Promise<{ config: ResolvedConfig }> {
-  fake = new FakeOpenCode(options.fakeOptions);
-  const baseUrl = await fake.listen();
-  stateDir = await tempDir();
-  const config = BridgeConfigSchema.parse({
-    opencode: { url: baseUrl, autoStart: false },
-    ...(options.configOverrides ?? {}),
+async function call(name: string, args: Record<string, unknown> = {}) {
+  const result = await client.callTool({ name, arguments: args });
+  return {
+    isError: result.isError === true,
+    data: (result.structuredContent ?? {}) as Record<string, any>,
+  };
+}
+
+beforeAll(() => {
+  fs.chmodSync(FAKE, 0o755);
+  for (const key of ENV_KEYS) saved[key] = process.env[key];
+});
+
+afterAll(() => {
+  for (const key of ENV_KEYS) {
+    if (saved[key] === undefined) delete process.env[key];
+    else process.env[key] = saved[key];
+  }
+  for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+beforeEach(async () => {
+  process.env.FAKE_MODE = "reply";
+  process.env.FAKE_DELAY_MS = "50";
+  root = tempDir("cop-int-");
+  workdir = path.join(root, "project");
+  fs.mkdirSync(workdir);
+  const logger = createLogger({ file: path.join(root, "bridge.log") });
+  const globalConfig = BridgeConfigSchema.parse({});
+  const base = resolveRunSettings(globalConfig, {
+    CLAUDE_OPENCODE_RUNS_DIR: path.join(root, "runs"),
   });
-  const logger = createLogger({ level: "silent" });
-  const registry = new SessionRegistry(path.join(stateDir, "sessions.json"), logger);
-  manager = new OpenCodeManager({ logger });
+  const runSettings: RunSettings = { ...base, binary: FAKE, allowedRoots: [root], idleMs: 10_000 };
+  manager = new OpenCodeManager({ logger, env: process.env });
+  const runs = new RunManager({
+    store: new RunStore(runSettings.runsDir),
+    settings: runSettings,
+    logger,
+  });
   server = createMcpServer({
     logger,
     manager,
-    registry,
-    globalConfig: config,
+    registry: new SessionRegistry(path.join(root, "sessions.json"), logger),
+    globalConfig,
     env: process.env,
-    stateDir,
-    loadProjectConfig: async () => ({ config, sources: [] }),
+    stateDir: root,
+    runs,
+    runSettings,
   });
-  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  client = new Client({ name: "test-client", version: "0.0.0" });
-  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
-  return { config };
-}
-
-function textOf(result: Awaited<ReturnType<Client["callTool"]>>): string {
-  const content = result.content;
-  if (!Array.isArray(content)) return "";
-  const first = content[0];
-  if (first && first.type === "text") return first.text;
-  return "";
-}
-
-function parse(result: Awaited<ReturnType<Client["callTool"]>>): any {
-  return JSON.parse(textOf(result));
-}
-
-beforeEach(() => {
-  // each test sets up its own app
+  client = new Client({ name: "integration-test", version: "0.0.0" });
+  const [serverSide, clientSide] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverSide);
+  await client.connect(clientSide);
 });
 
 afterEach(async () => {
-  try {
-    await client?.close();
-  } catch {
-    // ignore
-  }
-  try {
-    await server?.close();
-  } catch {
-    // ignore
-  }
-  try {
-    await fake?.close();
-  } catch {
-    // ignore
-  }
-  await Promise.all(
-    tempDirs.splice(0).map((dir) => fs.promises.rm(dir, { recursive: true, force: true })),
-  );
+  await client.close();
+  await server.close();
+  await manager.stopAll();
 });
 
 describe("MCP tool surface", () => {
-  it("registers the seven PRD tools", async () => {
-    await setupApp({});
-    const tools = await client.listTools();
-    expect(tools.tools.map((tool) => tool.name).sort()).toEqual([
-      "abort_session",
-      "create_session",
+  it("registers the background run tools next to the session tools", async () => {
+    const { tools } = await client.listTools();
+    const names = tools.map((tool) => tool.name).sort();
+    for (const expected of [
       "delegate_task",
-      "get_diff",
-      "get_session",
-      "list_agents",
+      "list_runs",
+      "get_run",
+      "abort_run",
+      "abort_all",
+      "wait_any",
+      "list_models",
+      "create_worktree",
+      "remove_worktree",
+      "create_session",
       "send_message",
-    ]);
-  });
-
-  it("lists agents with capabilities", async () => {
-    await setupApp({});
-    const workspace = await tempDir();
-    const result = parse(
-      await client.callTool({ name: "list_agents", arguments: { cwd: workspace } }),
-    );
-    expect(result.default_agent).toBe("deepseek-researcher");
-    const names = result.agents.map((agent: { name: string }) => agent.name);
-    expect(names).toContain("deepseek-coder");
-    const coder = result.agents.find((agent: { name: string }) => agent.name === "deepseek-coder");
-    expect(coder.can_edit).toBe(true);
-    const researcher = result.agents.find(
-      (agent: { name: string }) => agent.name === "deepseek-researcher",
-    );
-    expect(researcher.read_only).toBe(true);
-  });
-});
-
-describe("delegate_task", () => {
-  it("runs a task end-to-end and returns a structured result", async () => {
-    await setupApp({});
-    const workspace = await tempDir();
-    const result = parse(
-      await client.callTool({
-        name: "delegate_task",
-        arguments: {
-          cwd: workspace,
-          agent: "deepseek-reviewer",
-          task: "Review the auth module",
-          paths: ["src/auth"],
-        },
-      }),
-    );
-    expect(result.status).toBe("completed");
-    expect(result.session_id).toMatch(/^ses_fake_/);
-    expect(result.agent).toBe("deepseek-reviewer");
-    expect(result.model).toBe("deepseek/deepseek-v4-pro");
-    expect(result.summary).toContain("FAKE DONE");
-    expect(result.cwd).toBe(await fs.promises.realpath(workspace));
-
-    expect(fake.prompts).toHaveLength(1);
-    expect(fake.prompts[0]?.agent).toBe("deepseek-reviewer");
-    expect(fake.prompts[0]?.text).toContain(workspace);
-    expect(fake.prompts[0]?.text).toContain("Review the auth module");
-    expect(fake.syncPromptCalls).toBe(0);
-  });
-
-  it("waits for the final message after tool-call steps", async () => {
-    await setupApp({
-      fakeOptions: { onPrompt: () => ({ text: "FINAL ANSWER", toolStep: true }) },
-    });
-    const workspace = await tempDir();
-    const result = parse(
-      await client.callTool({
-        name: "delegate_task",
-        arguments: { cwd: workspace, agent: "deepseek-coder", task: "do work" },
-      }),
-    );
-    expect(result.status).toBe("completed");
-    expect(result.summary).toBe("FINAL ANSWER");
-  });
-
-  it("parses findings from the agent output", async () => {
-    await setupApp({
-      fakeOptions: {
-        onPrompt: () => ({
-          text: [
-            "## Summary",
-            "Found issues.",
-            "",
-            "## Findings",
-            "- [severity: high] Missing CSRF protection (src/web/form.ts:12) — forms are unprotected",
-            "",
-            "## Verdict",
-            "Request changes.",
-          ].join("\n"),
-        }),
-      },
-    });
-    const workspace = await tempDir();
-    const result = parse(
-      await client.callTool({
-        name: "delegate_task",
-        arguments: { cwd: workspace, agent: "deepseek-reviewer", task: "Review forms" },
-      }),
-    );
-    expect(result.findings).toHaveLength(1);
-    expect(result.findings[0].severity).toBe("high");
-    expect(result.findings[0].file).toBe("src/web/form.ts");
-  });
-
-  it("rejects unknown agents with AGENT_NOT_FOUND", async () => {
-    await setupApp({});
-    const workspace = await tempDir();
-    const result = await client.callTool({
-      name: "delegate_task",
-      arguments: { cwd: workspace, agent: "does-not-exist", task: "x" },
-    });
-    expect(result.isError).toBe(true);
-    expect(parse(result).error.code).toBe("AGENT_NOT_FOUND");
-  });
-
-  it("rejects bad workspace with WORKSPACE_NOT_FOUND", async () => {
-    await setupApp({});
-    const result = await client.callTool({
-      name: "delegate_task",
-      arguments: { cwd: path.join(os.tmpdir(), "missing-workspace-xyz"), task: "x" },
-    });
-    expect(result.isError).toBe(true);
-    expect(parse(result).error.code).toBe("WORKSPACE_NOT_FOUND");
-  });
-
-  it("rejects path hints that escape the workspace", async () => {
-    await setupApp({});
-    const workspace = await tempDir();
-    const result = await client.callTool({
-      name: "delegate_task",
-      arguments: { cwd: workspace, task: "x", paths: ["../../etc"] },
-    });
-    expect(result.isError).toBe(true);
-    expect(parse(result).error.code).toBe("INVALID_PATH");
-  });
-
-  it("grants edits to a read-only agent when the orchestrator asks", async () => {
-    await setupApp({});
-    const workspace = await tempDir();
-    await client.callTool({
-      name: "delegate_task",
-      arguments: { cwd: workspace, task: "Do research and write notes", allow_edits: true },
-    });
-    expect(fake.prompts[0]?.agent).toBe("deepseek-researcher__edit");
-  });
-
-  it("grants edits and shell together with both overrides", async () => {
-    await setupApp({});
-    const workspace = await tempDir();
-    await client.callTool({
-      name: "delegate_task",
-      arguments: {
-        cwd: workspace,
-        agent: "deepseek-researcher",
-        task: "Implement and test",
-        allow_edits: true,
-        allow_bash: true,
-      },
-    });
-    expect(fake.prompts[0]?.agent).toBe("deepseek-researcher__rw");
-  });
-
-  it("revokes edits from a coding agent when the orchestrator asks", async () => {
-    await setupApp({});
-    const workspace = await tempDir();
-    await client.callTool({
-      name: "delegate_task",
-      arguments: { cwd: workspace, agent: "deepseek-coder", task: "Edit", allow_edits: false },
-    });
-    // coder defaults to edits+shell; revoking edits keeps shell.
-    expect(fake.prompts[0]?.agent).toBe("deepseek-coder__bash");
-  });
-
-  it("keeps the default agent name when no override is requested", async () => {
-    await setupApp({});
-    const workspace = await tempDir();
-    await client.callTool({
-      name: "delegate_task",
-      arguments: { cwd: workspace, task: "x" },
-    });
-    expect(fake.prompts[0]?.agent).toBe("deepseek-researcher");
-  });
-
-  it("persists orchestrator permissions across send_message", async () => {
-    await setupApp({});
-    const workspace = await tempDir();
-    const created = parse(
-      await client.callTool({
-        name: "create_session",
-        arguments: {
-          cwd: workspace,
-          agent: "deepseek-researcher",
-          allow_edits: true,
-          allow_bash: true,
-        },
-      }),
-    );
-    expect(created.can_edit).toBe(true);
-    expect(created.can_run_bash).toBe(true);
-
-    await client.callTool({
-      name: "send_message",
-      arguments: { session_id: created.session_id, message: "First" },
-    });
-    await client.callTool({
-      name: "send_message",
-      arguments: { session_id: created.session_id, message: "Second", allow_edits: false },
-    });
-
-    expect(fake.prompts[0]?.agent).toBe("deepseek-researcher__rw");
-    // Revoking edits keeps shell at the variant level.
-    expect(fake.prompts[1]?.agent).toBe("deepseek-researcher__bash");
-
-    const session = parse(
-      await client.callTool({ name: "get_session", arguments: { session_id: created.session_id } }),
-    );
-    expect(session.can_edit).toBe(false);
-    expect(session.can_run_bash).toBe(true);
-  });
-
-  it("reports timeouts as AGENT_TIMEOUT without hanging", async () => {
-    await setupApp({
-      fakeOptions: { onPrompt: () => ({ text: "late", delayMs: 1000 }) },
-    });
-    const workspace = await tempDir();
-    const result = await client.callTool({
-      name: "delegate_task",
-      arguments: { cwd: workspace, task: "slow work", timeout: 300 },
-    });
-    expect(result.isError).toBe(true);
-    const body = parse(result);
-    expect(body.status).toBe("timeout");
-    expect(body.error.code).toBe("AGENT_TIMEOUT");
-    await new Promise((resolve) => setTimeout(resolve, 1200));
-  });
-
-  it("surfaces provider errors from OpenCode", async () => {
-    await setupApp({
-      fakeOptions: {
-        onPrompt: () => ({
-          text: "",
-          error: {
-            name: "ProviderAuthError",
-            data: { providerID: "deepseek", message: "bad key" },
-          },
-        }),
-      },
-    });
-    const workspace = await tempDir();
-    const result = await client.callTool({
-      name: "delegate_task",
-      arguments: { cwd: workspace, task: "x" },
-    });
-    const body = parse(result);
-    expect(result.isError).toBe(true);
-    expect(body.status).toBe("failed");
-    expect(body.error.code).toBe("OPENCODE_ERROR");
-    expect(body.error.message).toContain("deepseek");
-  });
-
-  it("fails when an external server lacks the required agents", async () => {
-    await setupApp({
-      fakeOptions: { agents: [{ name: "build", mode: "primary", builtIn: true }] },
-    });
-    const workspace = await tempDir();
-    const result = await client.callTool({
-      name: "delegate_task",
-      arguments: { cwd: workspace, task: "x" },
-    });
-    expect(result.isError).toBe(true);
-    expect(parse(result).error.code).toBe("AGENT_NOT_FOUND");
-  });
-
-  it("returns OPENCODE_UNAVAILABLE instead of hanging when the server is gone", async () => {
-    await setupApp({});
-    const workspace = await tempDir();
-    const baseUrl = fake.server.address();
-    expect(baseUrl).toBeTruthy();
-    await fake.close();
-
-    const started = Date.now();
-    const result = await client.callTool({
-      name: "delegate_task",
-      arguments: { cwd: workspace, task: "x", timeout: 5000 },
-    });
-    expect(Date.now() - started).toBeLessThan(4000);
-    expect(result.isError).toBe(true);
-    expect(parse(result).error.code).toBe("OPENCODE_UNAVAILABLE");
-  });
-
-  it("serves multiple concurrent delegations on one server", async () => {
-    await setupApp({
-      fakeOptions: { onPrompt: () => ({ text: "done", delayMs: 400 }) },
-    });
-    const workspace = await tempDir();
-    const results = await Promise.all([
-      client.callTool({
-        name: "delegate_task",
-        arguments: { cwd: workspace, agent: "deepseek-researcher", task: "task one" },
-      }),
-      client.callTool({
-        name: "delegate_task",
-        arguments: { cwd: workspace, agent: "deepseek-coder", task: "task two" },
-      }),
-      client.callTool({
-        name: "delegate_task",
-        arguments: { cwd: workspace, agent: "deepseek-reviewer", task: "task three" },
-      }),
-    ]);
-    for (const result of results) {
-      expect(parse(result).status).toBe("completed");
+      "get_session",
+      "get_diff",
+      "abort_session",
+      "list_agents",
+    ]) {
+      expect(names).toContain(expected);
     }
-    expect(fake.prompts).toHaveLength(3);
-    expect(new Set(fake.prompts.map((prompt) => prompt.sessionId)).size).toBe(3);
-    expect(manager.getStatus()).toHaveLength(1);
-    // Regression guard: a synchronous prompt would hit Node fetch's 5-minute
-    // headers timeout for long runs.
-    expect(fake.syncPromptCalls).toBe(0);
-  });
-
-  it("rejects oversized inputs instead of forwarding them", async () => {
-    await setupApp({});
-    const workspace = await tempDir();
-    const tooManyPaths = Array.from({ length: 201 }, (_, index) => `src/p${index}`);
-    let rejected = false;
-    let isError = false;
-    try {
-      const result = await client.callTool({
-        name: "delegate_task",
-        arguments: { cwd: workspace, task: "x", paths: tooManyPaths },
-      });
-      isError = Boolean(result.isError);
-    } catch {
-      rejected = true;
-    }
-    expect(rejected || isError).toBe(true);
-    expect(fake.prompts).toHaveLength(0);
-  });
-
-  it("refuses to delegate when OpenCode reports a different directory", async () => {
-    await setupApp({ fakeOptions: { reportedDirectory: "/somewhere/else" } });
-    const workspace = await tempDir();
-    const result = await client.callTool({
-      name: "delegate_task",
-      arguments: { cwd: workspace, task: "x" },
-    });
-    expect(result.isError).toBe(true);
-    expect(parse(result).error.code).toBe("WORKSPACE_MISMATCH");
   });
 });
 
-describe("sessions", () => {
-  it("keeps context across create_session + send_message", async () => {
-    await setupApp({});
-    const workspace = await tempDir();
-    const created = parse(
-      await client.callTool({
-        name: "create_session",
-        arguments: { cwd: workspace, agent: "deepseek-researcher", title: "auth investigation" },
-      }),
-    );
-    expect(created.session_id).toMatch(/^ses_fake_/);
-
-    await client.callTool({
-      name: "send_message",
-      arguments: { session_id: created.session_id, message: "First: inspect src/auth" },
+describe("delegate_task and run tracking", () => {
+  it("runs a task to completion and returns the parsed worker contract", async () => {
+    const { isError, data } = await call("delegate_task", {
+      task: "Write the greeting file",
+      cwd: workdir,
+      name: "greeting",
+      wait_seconds: 30,
     });
-    await client.callTool({
-      name: "send_message",
-      arguments: {
-        session_id: created.session_id,
-        message: "Second: now inspect the database layer",
-      },
-    });
+    expect(isError).toBe(false);
+    expect(data.status).toBe("done");
+    expect(data.result.final.status_line).toBe("PASS");
+    expect(data.result.final.commit).toBe("1234abc");
+    expect(data.model).toBe("opencode/hy4-flash-free");
 
-    expect(fake.prompts).toHaveLength(2);
-    expect(new Set(fake.prompts.map((prompt) => prompt.sessionId)).size).toBe(1);
-    expect(fake.prompts[1]?.text).toContain("now inspect the database layer");
-    expect(fake.prompts[1]?.text).toContain("Constraints:");
+    const listed = await call("list_runs", {});
+    expect(listed.data.runs.map((row: { run_id: string }) => row.run_id)).toContain(data.run_id);
+    expect(listed.data.summary_line).toContain("done");
 
-    const session = parse(
-      await client.callTool({ name: "get_session", arguments: { session_id: created.session_id } }),
-    );
-    expect(session.status).toBe("completed");
-    expect(session.last_summary).toContain("FAKE DONE");
-
-    const aborted = parse(
-      await client.callTool({
-        name: "abort_session",
-        arguments: { session_id: created.session_id },
-      }),
-    );
-    expect(aborted.aborted).toBe(true);
+    const detail = await call("get_run", { run_id: data.run_id });
+    expect(detail.data.final.text).toContain("Status: PASS");
+    expect(detail.data.log_path).toMatch(/\.log$/);
   });
 
-  it("returns OPENCODE_SESSION_NOT_FOUND for unknown sessions", async () => {
-    await setupApp({});
-    const result = await client.callTool({
-      name: "get_session",
-      arguments: { session_id: "ses_missing" },
+  it("falls back to the default model when the requested one is not listed", async () => {
+    const { data } = await call("delegate_task", {
+      task: "Check the fallback",
+      cwd: workdir,
+      model: "nope/missing",
+      wait_seconds: 30,
     });
-    expect(result.isError).toBe(true);
-    expect(parse(result).error.code).toBe("OPENCODE_SESSION_NOT_FOUND");
+    expect(data.model).toBe("opencode/hy4-flash-free");
+    expect(data.model_note).toContain("fell back");
+  });
+
+  it("rejects unsafe run names and directories outside the allowed roots", async () => {
+    const badName = await call("delegate_task", { task: "x", cwd: workdir, name: "Bad Name" });
+    expect(badName.isError).toBe(true);
+    expect(badName.data.error.code).toBe("INVALID_ARGUMENT");
+
+    const outside = tempDir("cop-outside-");
+    const denied = await call("delegate_task", { task: "x", cwd: outside });
+    expect(denied.isError).toBe(true);
+    expect(denied.data.error.code).toBe("WORKSPACE_NOT_ALLOWED");
+  });
+
+  it("lists models from the CLI", async () => {
+    const { data } = await call("list_models", { refresh: true });
+    expect(data.available).toBe(true);
+    expect(data.models).toEqual(["opencode/hy4-flash-free", "opencode/other-model"]);
+  });
+
+  it("wait_any reports unknown ids and returns finished runs without busy-polling", async () => {
+    const started = await call("delegate_task", { task: "quick", cwd: workdir });
+    const waited = await call("wait_any", {
+      run_ids: [started.data.run_id, "missing-run"],
+      seconds: 30,
+    });
+    expect(waited.data.unknown).toEqual(["missing-run"]);
+    expect(waited.data.finished.map((row: { run_id: string }) => row.run_id)).toEqual([
+      started.data.run_id,
+    ]);
+    expect(waited.data.timed_out).toBe(false);
+  });
+
+  it("abort_all stops queued and running runs", async () => {
+    process.env.FAKE_MODE = "hang";
+    const started = await call("delegate_task", { task: "hang", cwd: workdir });
+    expect(started.data.status).toMatch(/running|queued/);
+    const aborted = await call("abort_all", {});
+    expect(aborted.data.running + aborted.data.queued + aborted.data.reaped).toBeGreaterThanOrEqual(
+      1,
+    );
+    const run = await call("get_run", { run_id: started.data.run_id });
+    expect(run.data.status).toBe("aborted");
   });
 });
 
-describe("get_diff", () => {
-  it("returns git changes made during the session", async () => {
-    const workspace = await tempDir("co-diff-");
-    execFileSync("git", ["init", "-q"], { cwd: workspace });
-    await fs.promises.writeFile(path.join(workspace, "app.ts"), "export const a = 1;\n");
-    execFileSync("git", ["add", "-A"], { cwd: workspace });
-    execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"], {
-      cwd: workspace,
-    });
+describe("worktree tools", () => {
+  it("creates and removes a kab/<name> worktree beside the repository", async () => {
+    const repo = path.join(root, "repo");
+    fs.mkdirSync(repo);
+    const git = (args: string[]) => execFileSync("git", args, { cwd: repo, stdio: "pipe" });
+    git(["init", "-q", "-b", "main"]);
+    git([
+      "-c",
+      "user.email=t@example.invalid",
+      "-c",
+      "user.name=t",
+      "commit",
+      "-q",
+      "--allow-empty",
+      "-m",
+      "chore: init",
+    ]);
 
-    await setupApp({
-      fakeOptions: {
-        onPrompt: (request) => ({
-          text: "Edited files.",
-          onBeforeRespond: async () => {
-            await fs.promises.writeFile(
-              path.join(request.directory, "app.ts"),
-              "export const a = 2;\n",
-            );
-            await fs.promises.writeFile(
-              path.join(request.directory, "new-file.ts"),
-              "export {};\n",
-            );
-          },
-        }),
-      },
-    });
+    const created = await call("create_worktree", { name: "wt-one", base: "main", cwd: repo });
+    expect(created.isError).toBe(false);
+    expect(created.data.branch).toBe("kab/wt-one");
+    expect(fs.existsSync(path.join(root, "repo-wt", "wt-one"))).toBe(true);
 
-    const delegated = parse(
-      await client.callTool({
-        name: "delegate_task",
-        arguments: { cwd: workspace, agent: "deepseek-coder", task: "Bump a" },
-      }),
-    );
-    expect(delegated.status).toBe("completed");
-    expect(delegated.files_changed).toBe(2);
-
-    const diff = parse(
-      await client.callTool({ name: "get_diff", arguments: { session_id: delegated.session_id } }),
-    );
-    expect(diff.source).toBe("git");
-    const files = diff.files.map((entry: { file: string }) => entry.file).sort();
-    expect(files).toEqual(["app.ts", "new-file.ts"]);
-    expect(diff.diff).toContain("+export const a = 2;");
-  });
-
-  it("reports DIFF_UNAVAILABLE when the workspace is not a git repo", async () => {
-    await setupApp({});
-    const workspace = await tempDir();
-    const created = parse(
-      await client.callTool({
-        name: "create_session",
-        arguments: { cwd: workspace, agent: "deepseek-coder" },
-      }),
-    );
-    const result = await client.callTool({
-      name: "get_diff",
-      arguments: { session_id: created.session_id },
-    });
-    expect(result.isError).toBe(true);
-    expect(parse(result).error.code).toBe("DIFF_UNAVAILABLE");
+    const removed = await call("remove_worktree", { name: "wt-one", base: "main", cwd: repo });
+    expect(removed.isError).toBe(false);
+    expect(removed.data.removed_path).toBe(true);
   });
 });

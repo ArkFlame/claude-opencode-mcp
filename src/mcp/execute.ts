@@ -5,6 +5,8 @@ import type { OpenCodeManager } from "../opencode/manager.js";
 import { runPrompt } from "../opencode/run.js";
 import type { SessionRegistry } from "../opencode/sessions.js";
 import type { PreparedRun } from "../opencode/setup.js";
+import type { RunManager } from "../runs/manager.js";
+import type { RunSettings } from "../runs/settings.js";
 import type { AgentSession, DelegateResult } from "../types/index.js";
 import { diffSinceBaseline, type GitBaseline } from "../util/git.js";
 import type { Logger } from "../util/logger.js";
@@ -18,6 +20,9 @@ export interface AppContext {
   globalConfig: ResolvedConfig;
   env: NodeJS.ProcessEnv;
   stateDir: string;
+  /** Background CLI runs started by delegate_task. */
+  runs: RunManager;
+  runSettings: RunSettings;
   /** Override per-workspace config loading (tests/embedding). */
   loadProjectConfig?: (cwd: string) => Promise<LoadedConfig>;
 }

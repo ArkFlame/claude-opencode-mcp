@@ -71,6 +71,25 @@ export const BridgeConfigSchema = z.object({
       execution: z.number().int().positive().default(600_000),
     })
     .prefault({}),
+  /** Background CLI runs (delegate_task). Seconds unless noted; env vars override each field. */
+  runs: z
+    .object({
+      /** Default model for runs, `provider/model`. Env: CLAUDE_OPENCODE_MODEL. */
+      model: z.string().default("opencode/hy4-flash-free"),
+      /** Default agent for runs. */
+      agent: z.string().default("deepseek-coder"),
+      /** Hard wall-clock limit per run. Env: CLAUDE_OPENCODE_TIMEOUT. */
+      timeout: z.number().int().positive().default(1_500),
+      /** Kill a run after this many seconds without output. Env: CLAUDE_OPENCODE_IDLE_TIMEOUT. */
+      idleTimeout: z.number().int().positive().default(300),
+      /** Concurrent runs. Env: CLAUDE_OPENCODE_MAX_PARALLEL. */
+      maxParallel: z.number().int().positive().max(64).default(10),
+      /** Retry once when a run ends without a final reply. */
+      retry: z.boolean().default(true),
+      /** Brief header template file. Env: CLAUDE_OPENCODE_BRIEF_HEADER. */
+      briefHeaderFile: z.string().nullable().default(null),
+    })
+    .prefault({}),
   security: SecurityConfigSchema,
   limits: z
     .object({

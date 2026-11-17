@@ -8,6 +8,9 @@ import { createMcpServer, SERVER_VERSION } from "./mcp/server.js";
 import { OpenCodeManager } from "./opencode/manager.js";
 import { SessionRegistry } from "./opencode/sessions.js";
 import { prepareRun } from "./opencode/setup.js";
+import { RunManager } from "./runs/manager.js";
+import { resolveRunSettings } from "./runs/settings.js";
+import { RunStore } from "./runs/store.js";
 import { createLogger, defaultLogFile, stateDirectory } from "./util/logger.js";
 
 async function runServer(): Promise<void> {
@@ -28,7 +31,24 @@ async function runServer(): Promise<void> {
 
   const registry = new SessionRegistry(path.join(stateDir, "sessions.json"), logger);
   const manager = new OpenCodeManager({ logger, env });
-  const server = createMcpServer({ logger, manager, registry, globalConfig, env, stateDir });
+  const runSettings = resolveRunSettings(globalConfig, env);
+  const runs = new RunManager({
+    store: new RunStore(runSettings.runsDir),
+    settings: runSettings,
+    logger,
+  });
+  // Reap runs left behind by a previous server (crash, kill -9) before accepting work.
+  runs.start();
+  const server = createMcpServer({
+    logger,
+    manager,
+    registry,
+    globalConfig,
+    env,
+    stateDir,
+    runs,
+    runSettings,
+  });
 
   let shuttingDown = false;
   const shutdown = async (reason: string) => {
@@ -41,6 +61,7 @@ async function runServer(): Promise<void> {
       // ignore
     }
     try {
+      await runs.shutdown();
       await manager.stopAll();
     } catch {
       // ignore
@@ -62,8 +83,13 @@ async function runServer(): Promise<void> {
   };
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  // The MCP host closing stdin means the session is over; do not leave runs behind.
+  process.stdin.once("end", () => void shutdown("stdin closed"));
   // Never orphan an OpenCode child, even if we exit through an unexpected path.
-  process.on("exit", () => manager.killAllSync());
+  process.on("exit", () => {
+    runs.killAllSync();
+    manager.killAllSync();
+  });
 
   if (globalConfig.opencode.autoStart && !globalConfig.opencode.url) {
     setImmediate(() => {
