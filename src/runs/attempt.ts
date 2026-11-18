@@ -87,6 +87,8 @@ export function runAttempt(
 ): Promise<AttemptResult> {
   return new Promise((resolve) => {
     const log = fs.createWriteStream(spec.logFile, { flags: "a", mode: 0o600 });
+    // A log that cannot be written (removed directory, full disk) must not crash the bridge.
+    log.on("error", () => undefined);
     const startedAt = Date.now();
     let lastActivity = startedAt;
     let logSize = -1;
