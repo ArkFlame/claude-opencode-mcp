@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-11-17
+### Added
+- Event streams: pools write `events.jsonl` in their pool directory and single runs write `events/<id>.jsonl` under the runs directory. Events cover unit start, done, failed, requeued, stale, lane cap changes, and pool done or stopped; run start and done.
+- `node <bridge> events --pool <id>` or `--run <id>` prints one line per event, a heartbeat each minute with the counts, and exits at the terminal event. `run_pool` and `delegate_task` return a `monitor.command` for Claude Code's Monitor tool.
+- `wait_pool` blocks (bounded, max 600 s) until `any_finished`, `failure`, `stale` or `all_done`, and returns events, counts and a cursor for the next call.
+- `pool_status` without `pool_id` adds session totals (running, queued, done, failed, stale, lane cap in use).
+- `set_pool_cap` changes one lane's cap on a live pool. `run_pool` takes `ramp` (start, step, max, every_seconds, backoff_on_failures) to raise lane caps gradually and cut back on failure spikes.
+- `run_pool` takes `stale_action` (`report` by default, or `abort_requeue`), and `requeue_stale` aborts silent workers on demand.
+- `queue_ttl_seconds` and `idle_timeout_seconds` on `delegate_task`, and `idle_timeout_seconds` on `run_pool`.
+- `CLAUDE_OPENCODE_IDLE_SECONDS` (default 300) and `CLAUDE_OPENCODE_MIN_FREE_MB` (default 1024). `CLAUDE_OPENCODE_IDLE_TIMEOUT` is still read as a fallback.
+- Run and pool records carry `error_kind` and the raw error (`error_raw`). Sqlite failures are classified as `sqlite_full`, `sqlite_busy` or `sqlite_other`. The classification is a best guess from the opaque opencode message.
+- `run_pool` takes `max_retries` (default 2). A sqlite failure requeues the unit with backoff and shrinks its lane by one. A lane is restored after five successes, and the pool stops after six consecutive sqlite failures.
+- `pool_status` lists `failed_units` (unit, exit code, error kind, log path). `run_pool` takes `retry_failed` to requeue them.
+- `run_pool` rescans `units_glob` every 5 s, so new open unit files join a live pool. It takes `add_units` for explicit paths. A unit that exited 0 is never run again.
+- Slot accounting counts live processes only, and `delegate_task` and `list_runs` report `slots {running, max, source}`.
+- Disk preflight refuses new runs with `disk_low` below the free-space floor. A live pool pauses new launches below it without killing workers.
+
+### Changed
+- The hard timeout starts at process start. Queued runs are not reaped by it; they expire after `queue_ttl_seconds` (default `timeout_seconds`, else one hour).
+- An idle run is confirmed before it is killed: any log growth counts as activity, and the kill waits for 10 s of silence. A run whose final assistant text exists when it goes silent completes.
+- Pools no longer kill silent workers by default. They report them as stale after `idle_timeout_seconds`, and abort them only with `stale_action: "abort_requeue"`.
+
+### Not done
+- `isolate_db` (a per-run `XDG_DATA_HOME`) is not implemented. It would move the session database that resume and usage stats read, and the auth layout could not be verified without live runs.
+
+### Fixed
+- Queued runs were reaped as if they had started, and sibling queues in the same session could be reaped by one process.
+- Slot counts included dead processes, so a full pool could report no free slots.
+
 ## [1.5.0] - 2026-11-17
 ### Added
 - Each Claude Code session has an owner identity: `CLAUDE_OPENCODE_OWNER` overrides the id and `CLAUDE_OPENCODE_LABEL` the label. The default id is the parent process and its start time, so a restarted server re-adopts its runs.

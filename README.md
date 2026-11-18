@@ -580,7 +580,10 @@ Environment variables (env overrides `config.json` values in the `runs` section)
 | --- | --- | --- |
 | `CLAUDE_OPENCODE_MODEL` | `opencode-go/hy4-flash-free` | Default run model (`provider/model`) |
 | `CLAUDE_OPENCODE_TIMEOUT` | `1500` | Hard timeout per run, seconds |
-| `CLAUDE_OPENCODE_IDLE_TIMEOUT` | `300` | Kill after this many seconds without output |
+| `CLAUDE_OPENCODE_IDLE_SECONDS` | `300` | Idle limit: a run is killed (pools report stale) after this many seconds with no log growth. Takes precedence over `CLAUDE_OPENCODE_IDLE_TIMEOUT` |
+| `CLAUDE_OPENCODE_IDLE_TIMEOUT` | `300` | Older name for the idle limit, read when `CLAUDE_OPENCODE_IDLE_SECONDS` is unset |
+| `CLAUDE_OPENCODE_MAX_PARALLEL` | `10` | Slots for concurrent runs. `delegate_task` and `list_runs` report `slots.source` as `env:CLAUDE_OPENCODE_MAX_PARALLEL`, `default` or `config` |
+| `CLAUDE_OPENCODE_MIN_FREE_MB` | `1024` | Free-space floor. Below it, new runs are refused with `disk_low` and a live pool pauses new launches |
 | `CLAUDE_OPENCODE_MAX_PARALLEL` | `10` | Concurrent runs; extra runs queue FIFO |
 | `CLAUDE_OPENCODE_ALLOWED_ROOTS` | parent of the repo | Path-delimiter-separated roots runs may use |
 | `CLAUDE_OPENCODE_BRIEF_HEADER` | built-in header | File whose text prepends every brief |
@@ -610,3 +613,29 @@ For large backlogs of small edits in one shared checkout, see [docs/POOL.md](doc
 | `pool_status` | Per-lane progress, provider hits, stale workers, ETA (read-only) |
 | `auto_commit` | Start, stop or inspect a loop that commits per area and pushes the branch |
 | `usage_stats` | Per-model tokens, reasoning share, TTFT and tokens/s from the opencode database (read-only) |
+
+## Monitoring and pool hardening (v1.6.0)
+
+### How an orchestrator monitors workers
+1. Start a run with `delegate_task` or a pool with `run_pool`. The result has `monitor.command`.
+2. Pass that command to Claude Code's Monitor tool. Each line of output becomes one notification.
+3. A `heartbeat` line every 60 s shows running, queued, done, failed and stale counts. Silence means nothing finished, not that the watch is broken.
+4. The stream ends at `pool_done` (or `run_done`, or `pool_stopped`). Nothing needs to be polled.
+5. For a blocking wait instead, call `wait_pool` with `until` and pass the returned `cursor` as `since` on the next call.
+
+The command runs without network access and reads the append-only files under the runs directory. Run it by hand as `node <bridge>/dist/index.js events --pool <id>`.
+
+### Pool controls
+- `set_pool_cap {pool_id, lane, cap}` changes a live lane's cap. The supervisor applies it on its next tick.
+- `run_pool` `ramp` starts lanes at `start` and adds `step` every `every_seconds` while the failures in that window stay below `backoff_on_failures`. A spike cuts one step back and pauses ramping for 10 minutes. Ramp settings apply when a pool starts, not when an existing pool is reused.
+- `run_pool` `stale_action`: `report` (default) or `abort_requeue`. A silent worker is aborted and its unit requeued while it has `max_retries` left.
+- `requeue_stale {pool_id}` aborts every silent worker now.
+- `pool_status` with no `pool_id` lists the session's pools with totals.
+
+### Failures
+- A sqlite failure requeues the unit with backoff (`max_retries`, default 2). Its lane shrinks by one slot, restored after five successes. Six consecutive sqlite failures stop the pool.
+- `error_kind` and `error_raw` on run and pool records keep the raw opencode message. The kind is a best guess: the opencode message is opaque.
+- `failed_units` in `pool_status` lists what failed; `run_pool` with `retry_failed: true` requeues them, except aborted units.
+- `run_pool` with `add_units` or new files under `units_glob` joins a live pool within 5 s. Units that exited 0 are not run again.
+- `isolate_db` is not implemented; see docs/POOL.md.
+

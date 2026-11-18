@@ -190,3 +190,12 @@ Pools belong to the Claude Code session that started them (see the README sectio
 - Queued messages record their owner. `list_messages` shows this session's messages by default, and `cancel_message` refuses another session's message unless `force: true` is passed.
 - `usage_stats` with the default `scope: "mine"` counts only sessions titled with this session's run ids, the `<name> (<run id>)` titles that delegate_task and pool workers use.
 
+## 1.6.0 changes
+
+- Events: each pool writes `events.jsonl` in its directory. `node <bridge> events --pool <id>` follows it, with a heartbeat every 60 s, and exits at `pool_done`. `wait_pool` blocks on the same file.
+- Failures: sqlite errors requeue with backoff and shrink the lane. Records keep `error_kind` and `error_raw`. The free-space floor (`CLAUDE_OPENCODE_MIN_FREE_MB`) pauses new launches without killing workers.
+- Units: the supervisor rescans `units_glob` every 5 s. `add_units` adds explicit paths and `retry_failed` requeues failed units. An exit-0 unit is never rerun.
+- Silence: a worker is silent when its log has not grown for `idle_timeout_seconds` (default `CLAUDE_OPENCODE_IDLE_SECONDS`, 300) and for 10 s. It is reported as stale. With `stale_action: "abort_requeue"` it is aborted and its unit requeued, up to `max_retries`. `requeue_stale` does this on demand.
+- Caps: `set_pool_cap` changes a live lane's cap. `ramp` raises caps gradually and backs off on failure spikes.
+- Not done: `isolate_db`. A per-run `XDG_DATA_HOME` would move the session database that resume and usage stats read.
+
