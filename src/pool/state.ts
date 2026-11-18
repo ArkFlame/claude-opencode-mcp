@@ -23,6 +23,9 @@ export interface PoolConfig {
   runsDir: string;
   poolDir: string;
   createdAt: number;
+  /** Owning Claude session; unit workers inherit it. Absent on pools started before 1.5.0. */
+  ownerId?: string | null;
+  ownerLabel?: string | null;
 }
 
 export type UnitState = "queued" | "running" | "killing" | "done" | "failed";
@@ -54,6 +57,9 @@ export interface PoolState {
   status: PoolStatus;
   reason: string | null;
   supervisor_pid: number | null;
+  /** Owning Claude session of the pool (see runs/owner.ts). */
+  owner_id?: string | null;
+  owner_label?: string | null;
   updated: number;
   consecutive_hits: number;
   lanes: Array<{
@@ -182,7 +188,7 @@ const RECORD_STATUS: Record<UnitState, RunStatus> = {
 export function syncRunRecord(
   store: RunStore,
   poolId: string,
-  config: Pick<PoolConfig, "cwd" | "poolDir" | "lanes" | "createdAt">,
+  config: Pick<PoolConfig, "cwd" | "poolDir" | "lanes" | "createdAt" | "ownerId" | "ownerLabel">,
   unit: UnitRecord,
   supervisorPid: number,
   now: number,
@@ -202,6 +208,8 @@ export function syncRunRecord(
     allow_shared_cwd: true,
     attempts: unit.attempts,
     owner_pid: supervisorPid,
+    owner_id: config.ownerId ?? null,
+    owner_label: config.ownerLabel ?? null,
     pid: unit.state === "running" || unit.state === "killing" ? unit.pid : null,
     pgid: unit.state === "running" || unit.state === "killing" ? unit.pgid : null,
     created: config.createdAt,

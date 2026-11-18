@@ -36,6 +36,9 @@ export interface RunRecord {
   allow_shared_cwd: boolean;
   attempts: number;
   owner_pid: number;
+  /** Owning Claude session (see owner.ts). Absent on records written before 1.5.0. */
+  owner_id?: string | null;
+  owner_label?: string | null;
   pid: number | null;
   pgid: number | null;
   created: number;

@@ -4,6 +4,8 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Logger } from "../util/logger.js";
 import { type AttemptResult, KILL_GRACE_MS, runAttempt } from "./attempt.js";
+import { foreignCwdHolder } from "./lock.js";
+import { createRunOwner, type OwnerScope, ownershipOf, type RunOwner } from "./owner.js";
 import type { RunSettings } from "./settings.js";
 import {
   isProcessAlive,
@@ -47,6 +49,8 @@ export interface RunManagerOptions {
   settings: Pick<RunSettings, "binary" | "maxParallel" | "retry" | "timeoutMs">;
   logger: Logger;
   ownerPid?: number;
+  /** Owning session; derived from the process environment when omitted. */
+  owner?: RunOwner;
 }
 
 export function newRunId(): string {
@@ -88,11 +92,13 @@ export class RunManager {
   private queue: Job[] = [];
   private readonly events = new EventEmitter();
   private readonly ownerPid: number;
+  readonly owner: RunOwner;
   private reaper: NodeJS.Timeout | null = null;
   private stopping = false;
 
   constructor(private readonly options: RunManagerOptions) {
-    this.ownerPid = options.ownerPid ?? process.pid;
+    this.owner = options.owner ?? createRunOwner({ env: process.env });
+    this.ownerPid = options.ownerPid ?? this.owner.pid;
     this.events.setMaxListeners(200);
   }
 
@@ -138,6 +144,8 @@ export class RunManager {
       allow_shared_cwd: input.allowSharedCwd,
       attempts: 0,
       owner_pid: this.ownerPid,
+      owner_id: this.owner.id,
+      owner_label: this.owner.label,
       pid: null,
       pgid: null,
       created: Date.now(),
@@ -173,17 +181,28 @@ export class RunManager {
     return this.queue.length;
   }
 
-  private canStart(job: Job): boolean {
+  private canStart(job: Job, foreign: RunRecord[]): boolean {
     if (job.input.allowSharedCwd) return true;
     for (const active of this.active.values()) {
       if (active.input.cwd === job.input.cwd) return false;
     }
-    return true;
+    return foreignCwdHolder(foreign, job.input.cwd, this.owner) === null;
+  }
+
+  /** Live runs of other sessions that could hold a cwd. Read once per pump, only when queued. */
+  private foreignRuns(): RunRecord[] {
+    return this.queue.length > 0 ? this.store.list() : [];
+  }
+
+  /** A run of another live session that holds this cwd, so a new run there must wait. */
+  collisionFor(cwd: string): RunRecord | null {
+    return foreignCwdHolder(this.store.list(), cwd, this.owner);
   }
 
   private pump(): void {
+    const foreign = this.foreignRuns();
     while (this.active.size < this.options.settings.maxParallel) {
-      const index = this.queue.findIndex((job) => this.canStart(job));
+      const index = this.queue.findIndex((job) => this.canStart(job, foreign));
       if (index < 0) return;
       const [job] = this.queue.splice(index, 1);
       if (!job) return;
@@ -335,17 +354,26 @@ export class RunManager {
     return stored;
   }
 
-  abortAll(): { queued: number; running: number; reaped: number } {
+  /**
+   * Abort this session's runs. Another live session's records are skipped unless scope is all
+   * and force is set. Unowned legacy records are orphans and are always cleared.
+   */
+  abortAll(options: { scope?: OwnerScope; force?: boolean } = {}): {
+    queued: number;
+    running: number;
+    reaped: number;
+  } {
+    const includeForeign = options.scope === "all" && options.force === true;
     const queued = this.queue.length;
     for (const job of [...this.queue]) this.abort(job.record.id);
     const running = this.active.size;
     for (const id of [...this.active.keys()]) this.abort(id);
     let reaped = 0;
     for (const record of this.store.list()) {
-      if (!isTerminal(record.status) && !this.active.has(record.id)) {
-        this.abort(record.id);
-        reaped += 1;
-      }
+      if (isTerminal(record.status) || this.active.has(record.id)) continue;
+      if (!includeForeign && ownershipOf(record, this.owner).foreign) continue;
+      this.abort(record.id);
+      reaped += 1;
     }
     return { queued, running, reaped };
   }
@@ -356,6 +384,7 @@ export class RunManager {
     const hardLimit = this.options.settings.timeoutMs + REAP_MARGIN_MS;
     for (const record of this.store.list()) {
       if (isTerminal(record.status) || this.active.has(record.id)) continue;
+      if (this.queue.some((job) => job.record.id === record.id)) continue;
       if (record.pool) {
         // Pool workers belong to their supervisor. Reap only when neither it nor the worker lives.
         const pgid = record.pgid ?? record.pid;
@@ -366,17 +395,39 @@ export class RunManager {
         }
         continue;
       }
-      const ownerGone = record.owner_pid === this.ownerPid || !isProcessAlive(record.owner_pid);
-      const overdue = record.started !== null && now - record.started > hardLimit;
-      if (!ownerGone && !overdue && record.status !== "queued") continue;
+      const view = ownershipOf(record, this.owner);
+      // Only a dead owner makes a run stale. A live other session's run is never touched.
+      const ownerGone = !isProcessAlive(record.owner_pid) && !this.adopt(record);
+      if (view.foreign && !ownerGone) continue;
+      const orphanQueued = view.mine && record.status === "queued";
+      const overdue = view.mine && record.started !== null && now - record.started > hardLimit;
+      if (!ownerGone && !orphanQueued && !overdue) continue;
       const reason = ownerGone
         ? "owner process exited; run reaped"
-        : "exceeded hard timeout; run reaped";
+        : orphanQueued
+          ? "queued run lost its queue; run reaped"
+          : "exceeded hard timeout; run reaped";
       this.reapRecord(record, reason, "stale");
       count += 1;
     }
     if (count > 0) this.options.logger.info("reaped stale runs", { count });
+    this.pump();
     return count;
+  }
+
+  /**
+   * A restarted MCP server under the same Claude session re-adopts its own live runs: the
+   * record's owner_pid moves to this process so the runs stay visible and abortable.
+   */
+  private adopt(record: RunRecord): boolean {
+    if (record.owner_id !== this.owner.id) return false;
+    const pgid = record.pgid ?? record.pid;
+    if (!pgid || !isProcessAlive(pgid) || !looksLikeOpencode(pgid)) return false;
+    record.owner_pid = this.ownerPid;
+    record.owner_label = this.owner.label;
+    this.persist(record);
+    this.options.logger.info("re-adopted run after server restart", { run_id: record.id });
+    return true;
   }
 
   private reapRecord(record: RunRecord, reason: string, status: RunStatus): void {
@@ -411,6 +462,8 @@ export class RunManager {
   ): Promise<{ finished: RunRecord[]; pending: string[]; unknown: string[]; timed_out: boolean }> {
     const deadline = Date.now() + seconds * 1000;
     for (;;) {
+      // A run of another session may have finished since the last check, freeing a cwd.
+      this.pump();
       const snapshot = this.collect(ids);
       const done = snapshot.finished.length > 0 || snapshot.pending.length === 0;
       if (done || Date.now() >= deadline) {

@@ -37,6 +37,8 @@ export interface QueuedMessage {
   delivered_at: number | null;
   /** Earliest time (ms) the next attempt may start. */
   next_attempt_at: number;
+  /** Owning Claude session; absent or null on messages written before 1.5.0. */
+  owner_id?: string | null;
 }
 
 export function assertRunId(runId: string): string {
@@ -92,6 +94,7 @@ function parseMessage(line: string): QueuedMessage | null {
     last_error: typeof value.last_error === "string" ? value.last_error : null,
     delivered_at: typeof value.delivered_at === "number" ? value.delivered_at : null,
     next_attempt_at: typeof value.next_attempt_at === "number" ? value.next_attempt_at : 0,
+    owner_id: typeof value.owner_id === "string" ? value.owner_id : null,
   };
 }
 
@@ -161,6 +164,8 @@ export interface EnqueueInput {
   mode?: MessageMode;
   priority?: number;
   now: number;
+  /** Owning Claude session of the message. */
+  ownerId?: string | null;
 }
 
 export function validateMessageText(text: string): string {
@@ -194,6 +199,7 @@ export function enqueueMessage(
     last_error: null,
     delivered_at: null,
     next_attempt_at: 0,
+    owner_id: input.ownerId ?? null,
   };
   const all = [...readInbox(file), message];
   writeInbox(file, all);

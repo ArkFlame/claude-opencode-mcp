@@ -603,6 +603,8 @@ export class PoolSupervisor {
       status: this.status,
       reason: this.reason,
       supervisor_pid: this.supervisorPid,
+      owner_id: this.config.ownerId ?? null,
+      owner_label: this.config.ownerLabel ?? null,
       updated: this.ops.now(),
       consecutive_hits: this.consecutiveHits,
       lanes: this.lanes.map((lane) => ({

@@ -24,6 +24,8 @@ export interface PoolStatusView {
   reason: string | null;
   supervisor_alive: boolean;
   supervisor_pid: number | null;
+  owner_id: string | null;
+  owner_label: string | null;
   counts: { total: number; queued: number; running: number; done: number; failed: number };
   lanes: LaneStatus[];
   stale_workers: Array<{ key: string; lane: string | null; idle_seconds: number }>;
@@ -110,6 +112,8 @@ export function buildPoolStatus(poolDir: string, now = Date.now()): PoolStatusVi
     reason: state?.reason ?? null,
     supervisor_alive: alive,
     supervisor_pid: state?.supervisor_pid ?? null,
+    owner_id: state?.owner_id ?? null,
+    owner_label: state?.owner_label ?? null,
     counts,
     lanes,
     stale_workers: stale,

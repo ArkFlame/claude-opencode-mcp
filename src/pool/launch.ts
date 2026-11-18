@@ -6,6 +6,7 @@ import { isProcessAlive, type RunRecord } from "../runs/store.js";
 import {
   POOLS_SUBDIR,
   type PoolConfig,
+  type PoolState,
   poolDirFor,
   readJson,
   readPoolState,
@@ -102,11 +103,14 @@ export function listPoolDirs(runsDir: string): string[] {
 }
 
 /** Ask every running pool to stop: the supervisors kill their workers and exit. */
-export function requestAllPoolStops(runsDir: string): number {
+export function requestAllPoolStops(
+  runsDir: string,
+  include: (state: PoolState) => boolean = () => true,
+): number {
   let count = 0;
   for (const dir of listPoolDirs(runsDir)) {
     const state = readPoolState(dir);
-    if (state?.status !== "running") continue;
+    if (state?.status !== "running" || !include(state)) continue;
     fs.writeFileSync(stopFileFor(dir), "stop\n", { mode: 0o600 });
     count += 1;
   }
