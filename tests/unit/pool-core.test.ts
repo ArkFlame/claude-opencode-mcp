@@ -63,6 +63,7 @@ describe("lane selection and limit penalties", () => {
     effectiveCap: 2,
     hits: 0,
     backoffUntil: 0,
+    sqliteShrink: 0,
     ...overrides,
   });
 

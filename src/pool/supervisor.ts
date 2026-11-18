@@ -14,12 +14,15 @@ import {
 } from "../queue/inbox.js";
 import { buildResumeArgs, findSessionIdByTitle, unitSessionTitles } from "../queue/resume.js";
 import { sharedSection } from "../runs/brief.js";
+import { classifySqlite, extractErrorLine } from "../runs/errors.js";
 import { buildRunArgs } from "../runs/manager.js";
 import { isProcessAlive, killProcessGroup, RunStore } from "../runs/store.js";
+import { findLowDisk, freeMbAt, type LowDisk, minFreeMb, opencodeDataDir } from "../util/disk.js";
 import {
   applyLimitHit,
   CONSECUTIVE_LIMIT_STOP,
   canStart,
+  DEFAULT_MAX_RETRIES,
   hubNames,
   isLimitFailure,
   KILL_GRACE_MS,
@@ -30,6 +33,9 @@ import {
   type RunningUnit,
   renderBrief,
   rsNamesIn,
+  SQLITE_BACKOFF_MS,
+  SQLITE_CONSECUTIVE_STOP,
+  SQLITE_RESTORE_AFTER,
   unitKeyOf,
 } from "./core.js";
 import {
@@ -61,6 +67,8 @@ export interface SupervisorOps {
   spawn(request: SpawnRequest): WorkerHandle;
   isAlive(pid: number): boolean;
   signal(pgid: number, signal: NodeJS.Signals): void;
+  /** Free megabytes at a path; absent means no disk preflight (tests). */
+  freeMb?(target: string): number | null;
   /** OpenCode session of a unit's latest run; needed to resume it with a queued message. */
   sessionOf?(key: string): string | null;
 }
@@ -70,6 +78,7 @@ export const PROCESS_OPS: SupervisorOps = {
   spawn: spawnDetachedWorker,
   isAlive: (pid) => isProcessAlive(pid),
   signal: (pgid, signal) => killProcessGroup(pgid, signal),
+  freeMb: freeMbAt,
   sessionOf: (key) => findSessionIdByTitle(unitSessionTitles(key)),
 };
 
@@ -95,6 +104,9 @@ export class PoolSupervisor {
   private status: PoolStatus = "running";
   private reason: string | null = null;
   private consecutiveHits = 0;
+  private consecutiveSqlite = 0;
+  private sqliteSuccesses = 0;
+  private pausedReason: string | null = null;
 
   constructor(
     private readonly config: PoolConfig,
@@ -110,6 +122,7 @@ export class PoolSupervisor {
       effectiveCap: lane.cap,
       hits: 0,
       backoffUntil: 0,
+      sqliteShrink: 0,
     }));
   }
 
@@ -119,12 +132,15 @@ export class PoolSupervisor {
     const prior: PoolState | null = readPoolState(this.config.poolDir);
     if (prior) {
       this.consecutiveHits = prior.consecutive_hits;
+      this.consecutiveSqlite = prior.consecutive_sqlite ?? 0;
+      this.sqliteSuccesses = prior.sqlite_successes ?? 0;
       for (const lane of this.lanes) {
         const saved = prior.lanes.find((entry) => entry.name === lane.name);
         if (!saved) continue;
         lane.effectiveCap = Math.min(lane.cap, saved.effective_cap);
         lane.hits = saved.hits;
         lane.backoffUntil = saved.backoff_until;
+        lane.sqliteShrink = saved.sqlite_shrink ?? 0;
       }
     }
     const open: UnitFile[] = [];
@@ -392,9 +408,11 @@ export class PoolSupervisor {
     if (unit.error === "aborted") {
       unit.state = "failed";
       unit.finished = this.ops.now();
+      unit.errorKind = "aborted";
     } else if (unit.timeouts >= MAX_TIMEOUTS) {
       unit.state = "failed";
       unit.finished = this.ops.now();
+      unit.errorKind = "timeout";
     } else {
       unit.state = "queued";
     }
@@ -413,14 +431,23 @@ export class PoolSupervisor {
       this.limitHit(unit, now);
       return;
     }
+    const sqlite = exitCode === 0 ? null : classifySqlite(tail);
+    if (sqlite) {
+      this.settleMessage(unit.key, message, false, sqlite, now);
+      this.sqliteHit(unit, exitCode, sqlite, extractErrorLine(tail), now);
+      return;
+    }
     const error = exitCode === 0 ? null : exitCode === null ? "worker lost" : `exit ${exitCode}`;
     this.settleMessage(unit.key, message, exitCode === 0, error, now);
     unit.exitCode = exitCode;
+    unit.errorKind = null;
+    unit.errorRaw = null;
     if (exitCode === 0) {
       unit.state = "done";
       unit.finished = now;
       unit.error = null;
       this.consecutiveHits = 0;
+      this.noteSqliteSuccess();
     } else if (exitCode === null && unit.attempts < MAX_LOST_ATTEMPTS) {
       unit.state = "queued";
       unit.lane = null;
@@ -429,8 +456,78 @@ export class PoolSupervisor {
       unit.state = "failed";
       unit.finished = now;
       unit.error = error;
+      unit.errorKind = exitCode === null ? "worker_lost" : "exit";
+      unit.errorRaw = extractErrorLine(tail);
     }
     this.save(unit);
+  }
+
+  /**
+   * A sqlite failure requeues the unit with backoff, shrinks its lane by one slot (never below
+   * one), and counts toward stopping the pool. Units past max_retries fail with their error kind.
+   */
+  private sqliteHit(
+    unit: UnitRecord,
+    exitCode: number | null,
+    kind: string,
+    raw: string | null,
+    now: number,
+  ): void {
+    const lane = this.lanes.find((entry) => entry.name === unit.lane);
+    if (lane && lane.effectiveCap > 1) {
+      lane.effectiveCap -= 1;
+      lane.sqliteShrink += 1;
+    }
+    this.consecutiveSqlite += 1;
+    this.sqliteSuccesses = 0;
+    fs.rmSync(unitPaths(this.config.poolDir, unit.key).exit, { force: true });
+    unit.exitCode = exitCode;
+    unit.errorKind = kind;
+    unit.errorRaw = raw;
+    unit.lane = null;
+    unit.sqliteRetries = (unit.sqliteRetries ?? 0) + 1;
+    const maxRetries = this.config.maxRetries ?? DEFAULT_MAX_RETRIES;
+    if (unit.sqliteRetries > maxRetries) {
+      unit.state = "failed";
+      unit.finished = now;
+      unit.error = `${kind}; retries exhausted`;
+      unit.notBefore = null;
+    } else {
+      unit.state = "queued";
+      unit.error = `${kind}; requeued`;
+      unit.notBefore = now + SQLITE_BACKOFF_MS * unit.sqliteRetries;
+    }
+    this.save(unit);
+    if (this.consecutiveSqlite >= SQLITE_CONSECUTIVE_STOP) {
+      this.stop(
+        "limit-stopped",
+        `${SQLITE_CONSECUTIVE_STOP} consecutive sqlite failures (${kind})`,
+        now,
+      );
+    }
+  }
+
+  /** Any success ends a sqlite streak; enough of them give one shrunk slot back. */
+  private noteSqliteSuccess(): void {
+    this.consecutiveSqlite = 0;
+    this.sqliteSuccesses += 1;
+    if (this.sqliteSuccesses < SQLITE_RESTORE_AFTER) return;
+    this.sqliteSuccesses = 0;
+    const lane = this.lanes.find((entry) => entry.sqliteShrink > 0);
+    if (!lane) return;
+    lane.sqliteShrink -= 1;
+    lane.effectiveCap = Math.min(lane.cap, lane.effectiveCap + 1);
+  }
+
+  /** Free disk under the cwd or the opencode data dir, when below the floor. Null when fine. */
+  private lowDisk(): LowDisk | null {
+    const freeMb = this.ops.freeMb;
+    if (!freeMb) return null;
+    return findLowDisk(
+      [this.config.cwd, opencodeDataDir(process.env)],
+      minFreeMb(process.env),
+      freeMb,
+    );
   }
 
   private limitHit(unit: UnitRecord, now: number): void {
@@ -466,7 +563,12 @@ export class PoolSupervisor {
           (b.pending?.priority ?? 0) - (a.pending?.priority ?? 0) ||
           a.unit.key.localeCompare(b.unit.key),
       );
+    // Low disk pauses new launches; running workers are left alone.
+    const low = this.lowDisk();
+    this.pausedReason = low ? "disk_low" : null;
+    if (low) return;
     for (const { unit } of queued) {
+      if ((unit.notBefore ?? 0) > now) continue;
       const busy = this.busyByLane();
       const lane = pickLane(this.lanes, busy, now);
       if (!lane) return;
@@ -532,6 +634,8 @@ export class PoolSupervisor {
       unit.attempts += 1;
       unit.killedAt = null;
       unit.error = null;
+      unit.errorKind = null;
+      unit.notBefore = null;
       unit.finished = null;
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
@@ -607,6 +711,9 @@ export class PoolSupervisor {
       owner_label: this.config.ownerLabel ?? null,
       updated: this.ops.now(),
       consecutive_hits: this.consecutiveHits,
+      consecutive_sqlite: this.consecutiveSqlite,
+      sqlite_successes: this.sqliteSuccesses,
+      paused_reason: this.pausedReason,
       lanes: this.lanes.map((lane) => ({
         name: lane.name,
         model: lane.model,
@@ -614,6 +721,7 @@ export class PoolSupervisor {
         effective_cap: lane.effectiveCap,
         hits: lane.hits,
         backoff_until: lane.backoffUntil,
+        sqlite_shrink: lane.sqliteShrink,
       })),
     });
   }

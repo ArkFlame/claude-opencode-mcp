@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { BridgeError } from "../errors.js";
 
 export const DEFAULT_MIN_FREE_MB = 1024;
 const BYTES_PER_MB = 1024 * 1024;
@@ -52,4 +53,15 @@ export function findLowDisk(
     if (free !== null && free < minMb) return { path: target, free_mb: free, min_free_mb: minMb };
   }
   return null;
+}
+
+/** Throw DISK_LOW before a new run or pool starts when a filesystem is below the floor. */
+export function assertDiskFree(paths: readonly string[], env: NodeJS.ProcessEnv): void {
+  const low = findLowDisk(paths, minFreeMb(env));
+  if (!low) return;
+  throw new BridgeError(
+    "DISK_LOW",
+    `disk_low: ${low.free_mb} MB free at ${low.path}, below the ${low.min_free_mb} MB floor (CLAUDE_OPENCODE_MIN_FREE_MB). Free space before starting runs.`,
+    { details: { path: low.path, free_mb: low.free_mb, min_free_mb: low.min_free_mb } },
+  );
 }

@@ -16,7 +16,7 @@ import { listModels, resolveRunModel } from "../../runs/models.js";
 import { assertModelId, assertRunName } from "../../runs/names.js";
 import { runDetail, runRow } from "../../runs/view.js";
 import { assertInsideRoots, defaultAllowedRoot, git, repoRootOf } from "../../runs/worktree.js";
-import { findLowDisk, minFreeMb, opencodeDataDir } from "../../util/disk.js";
+import { assertDiskFree, opencodeDataDir } from "../../util/disk.js";
 import { requestId } from "../../util/text.js";
 import type { AppContext } from "../execute.js";
 import { loadWorkspaceConfig } from "../execute.js";
@@ -150,17 +150,6 @@ export function registerDelegateTask(server: McpServer, ctx: AppContext): void {
         return errorResult(error, id);
       }
     },
-  );
-}
-
-/** Refuse a new run when any of these filesystems is below CLAUDE_OPENCODE_MIN_FREE_MB. */
-export function assertDiskFree(paths: readonly string[], env: NodeJS.ProcessEnv): void {
-  const low = findLowDisk(paths, minFreeMb(env));
-  if (!low) return;
-  throw new BridgeError(
-    "DISK_LOW",
-    `disk_low: ${low.free_mb} MB free at ${low.path}, below the ${low.min_free_mb} MB floor (CLAUDE_OPENCODE_MIN_FREE_MB). Free space before starting runs.`,
-    { details: { path: low.path, free_mb: low.free_mb, min_free_mb: low.min_free_mb } },
   );
 }
 

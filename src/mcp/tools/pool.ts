@@ -4,7 +4,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { BridgeError } from "../../errors.js";
 import { AutoCommitter, MAX_INTERVAL_S, MIN_INTERVAL_S } from "../../git/auto-commit.js";
-import { PER_FILE_CAP_DEFAULT } from "../../pool/core.js";
+import { DEFAULT_MAX_RETRIES, PER_FILE_CAP_DEFAULT } from "../../pool/core.js";
 import { isSupervisorAlive, listPoolDirs, startPool } from "../../pool/launch.js";
 import {
   type LaneConfig,
@@ -20,6 +20,7 @@ import { assertModelId, assertRunName } from "../../runs/names.js";
 import { assertMutable, filterByScope, ownershipOf, type RunOwner } from "../../runs/owner.js";
 import { assertInsideRoots, defaultAllowedRoot, repoRootOf } from "../../runs/worktree.js";
 import { DEFAULT_USAGE_LIMIT, MAX_USAGE_LIMIT, usageReport } from "../../usage/stats.js";
+import { assertDiskFree, opencodeDataDir } from "../../util/disk.js";
 import { requestId } from "../../util/text.js";
 import type { AppContext } from "../execute.js";
 import { errorResult, jsonResult } from "../tool-utils.js";
@@ -101,6 +102,7 @@ export function registerPoolTools(server: McpServer, ctx: AppContext): void {
         "Units whose `<unit>.exit` is 0 are skipped. Units naming the same exclusive .rs file never run together; generic and hub files are capped by per_file_cap.",
         "The pool runs in a detached supervisor, so it survives this MCP server. Calling again with the same units_glob and cwd adopts the live pool.",
         "Provider limit errors requeue the unit, shrink that lane by one and back off; six consecutive hits stop the pool.",
+        "Opencode sqlite failures requeue the unit with backoff up to max_retries and shrink its lane (never below one slot); six in a row stop the pool. Low free disk (CLAUDE_OPENCODE_MIN_FREE_MB) pauses launches.",
       ].join(" "),
       inputSchema: {
         units_glob: z
@@ -155,6 +157,15 @@ export function registerPoolTools(server: McpServer, ctx: AppContext): void {
           .max(20)
           .optional()
           .describe('Commands workers must not run (default ["git", "cargo"]).'),
+        max_retries: z
+          .number()
+          .int()
+          .min(0)
+          .max(10)
+          .optional()
+          .describe(
+            `Retries for a unit hit by an opencode sqlite failure, with backoff (default ${DEFAULT_MAX_RETRIES}).`,
+          ),
         force: FORCE_PARAM,
       },
       annotations: { openWorldHint: true },
@@ -183,6 +194,7 @@ export function registerPoolTools(server: McpServer, ctx: AppContext): void {
           perFileCap: args.per_file_cap ?? PER_FILE_CAP_DEFAULT,
           timeoutMs: (args.timeout_s ?? DEFAULT_TIMEOUT_S) * 1000,
           forbid: validateForbid(args.forbid),
+          maxRetries: args.max_retries ?? DEFAULT_MAX_RETRIES,
           briefTemplate,
           runsDir: ctx.runSettings.runsDir,
           poolDir: poolDirFor(ctx.runSettings.runsDir, id),
@@ -205,6 +217,7 @@ export function registerPoolTools(server: McpServer, ctx: AppContext): void {
             args.force,
           );
         }
+        assertDiskFree([cwd, opencodeDataDir(ctx.env)], ctx.env);
         const started = startPool(config);
         return {
           ...started,

@@ -29,6 +29,16 @@ export interface PoolStatusView {
   counts: { total: number; queued: number; running: number; done: number; failed: number };
   lanes: LaneStatus[];
   stale_workers: Array<{ key: string; lane: string | null; idle_seconds: number }>;
+  /** Failed units with their exit code, error kind and log, so no `.exit` diffing is needed. */
+  failed_units: Array<{
+    unit: string;
+    exit_code: number | null;
+    error_kind: string | null;
+    error: string | null;
+    log_path: string;
+  }>;
+  /** Why the supervisor is holding new launches (e.g. "disk_low"), or null. */
+  paused_reason: string | null;
   rate_per_minute: number;
   eta_minutes: number | null;
 }
@@ -99,6 +109,16 @@ export function buildPoolStatus(poolDir: string, now = Date.now()): PoolStatusVi
     }
   }
 
+  const failedUnits: PoolStatusView["failed_units"] = units
+    .filter((unit) => unit.state === "failed")
+    .map((unit) => ({
+      unit: unit.key,
+      exit_code: unit.exitCode,
+      error_kind: unit.errorKind ?? null,
+      error: unit.error,
+      log_path: unitPaths(poolDir, unit.key).log,
+    }));
+
   const finishTimes = units
     .filter((unit) => unit.state === "done" && unit.finished !== null)
     .map((unit) => unit.finished as number);
@@ -117,6 +137,8 @@ export function buildPoolStatus(poolDir: string, now = Date.now()): PoolStatusVi
     counts,
     lanes,
     stale_workers: stale,
+    failed_units: failedUnits,
+    paused_reason: state?.paused_reason ?? null,
     rate_per_minute: Number(eta.perMinute.toFixed(3)),
     eta_minutes: eta.etaMinutes === null ? null : Math.round(eta.etaMinutes),
   };

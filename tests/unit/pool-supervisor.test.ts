@@ -13,6 +13,7 @@ import {
   unitRecordId,
   writeUnit,
 } from "../../src/pool/state.js";
+import { buildPoolStatus } from "../../src/pool/status.js";
 import { PoolSupervisor, type SupervisorOps } from "../../src/pool/supervisor.js";
 import { scanUnits } from "../../src/pool/units.js";
 import { type RunRecord, RunStore } from "../../src/runs/store.js";
@@ -41,6 +42,8 @@ class FakeOps implements SupervisorOps {
   readonly alive = new Set<number>();
   readonly spawns: Spawn[] = [];
   readonly signals: Array<{ pgid: number; signal: string }> = [];
+  /** Free space probe; undefined disables the disk preflight. */
+  freeMb: ((target: string) => number | null) | undefined = undefined;
 
   now(): number {
     return this.clock;
@@ -373,5 +376,89 @@ describe("run store mirror", () => {
     ops.end("a", 0);
     supervisor.tick();
     expect(new RunStore(config.runsDir).get(unitRecordId(POOL_ID, "a"))?.status).toBe("done");
+  });
+});
+
+const SQLITE_LOG =
+  'step_start\n{"type":"error","error":{"data":{"message":"Failed to execute statement"}}}\n';
+
+describe("sqlite failures", () => {
+  it("requeues a unit with backoff, shrinks its lane by one, and relaunches it", () => {
+    const { ops, supervisor, config } = boot({ "a.md": OPEN }, { perFileCap: 2 });
+    supervisor.tick();
+    ops.end("a", 1, SQLITE_LOG);
+    supervisor.tick();
+    expect(supervisor.unit("a")?.state).toBe("queued");
+    expect(supervisor.unit("a")?.errorKind).toBe("sqlite_other");
+    expect(readPoolState(config.poolDir)?.lanes[0]?.effective_cap).toBe(1);
+    supervisor.tick();
+    expect(ops.spawns.filter((spawn) => spawn.key === "a")).toHaveLength(1);
+    ops.clock += 31_000;
+    supervisor.tick();
+    expect(ops.spawns.filter((spawn) => spawn.key === "a")).toHaveLength(2);
+  });
+
+  it("fails a unit once its retries are exhausted and keeps the raw error", () => {
+    const { ops, supervisor } = boot({ "a.md": OPEN }, { maxRetries: 0 });
+    supervisor.tick();
+    ops.end("a", 1, SQLITE_LOG);
+    supervisor.tick();
+    const unit = supervisor.unit("a");
+    expect(unit?.state).toBe("failed");
+    expect(unit?.errorKind).toBe("sqlite_other");
+    expect(unit?.errorRaw).toContain("Failed to execute statement");
+  });
+
+  it("stops the pool after six consecutive sqlite failures", () => {
+    const names = ["a", "b", "c", "d", "e", "f"];
+    const units = Object.fromEntries(names.map((name) => [`${name}.md`, OPEN]));
+    const { ops, supervisor } = boot(units, { maxRetries: 10 });
+    for (const name of names) {
+      supervisor.tick();
+      ops.end(name, 1, SQLITE_LOG);
+    }
+    supervisor.tick();
+    expect(supervisor.poolStatus()).toBe("limit-stopped");
+  });
+
+  it("gives back a shrunk slot after five successes", () => {
+    const names = ["a", "b", "c", "d", "e", "f"];
+    const units = Object.fromEntries(names.map((name) => [`${name}.md`, OPEN]));
+    const { ops, supervisor, config } = boot(units, { maxRetries: 10 });
+    supervisor.tick();
+    ops.end("a", 1, SQLITE_LOG);
+    supervisor.tick();
+    expect(readPoolState(config.poolDir)?.lanes[0]?.effective_cap).toBe(1);
+    for (const name of ["b", "c", "d", "e", "f"]) {
+      ops.clock += 1_000;
+      supervisor.tick();
+      ops.end(name, 0);
+      supervisor.tick();
+    }
+    expect(readPoolState(config.poolDir)?.lanes[0]?.effective_cap).toBe(2);
+  });
+
+  it("pauses new launches while the disk is low and reports the reason", () => {
+    const { ops, supervisor, config } = boot({ "a.md": OPEN });
+    ops.freeMb = () => 10;
+    supervisor.tick();
+    expect(ops.spawns).toHaveLength(0);
+    expect(readPoolState(config.poolDir)?.paused_reason).toBe("disk_low");
+    ops.freeMb = () => 5_000;
+    supervisor.tick();
+    expect(ops.spawns).toHaveLength(1);
+    expect(readPoolState(config.poolDir)?.paused_reason).toBeNull();
+  });
+
+  it("lists failed units with exit code, error kind and log path", () => {
+    const { ops, supervisor, config } = boot({ "a.md": OPEN });
+    supervisor.tick();
+    ops.end("a", 3, "plain failure\n");
+    supervisor.tick();
+    const view = buildPoolStatus(config.poolDir);
+    expect(view.failed_units).toEqual([
+      expect.objectContaining({ unit: "a", exit_code: 3, error_kind: "exit" }),
+    ]);
+    expect(view.failed_units[0]?.log_path).toBe(unitPaths(config.poolDir, "a").log);
   });
 });

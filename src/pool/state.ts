@@ -19,6 +19,8 @@ export interface PoolConfig {
   perFileCap: number;
   timeoutMs: number;
   forbid: string[];
+  /** Attempts after a sqlite failure before the unit fails. Default 2 (absent on older pools). */
+  maxRetries?: number;
   briefTemplate: string;
   runsDir: string;
   poolDir: string;
@@ -48,6 +50,13 @@ export interface UnitRecord {
   error: string | null;
   /** Queued message id this unit is delivering (resume attempt), or null. */
   message?: string | null;
+  /** Classified failure of the last attempt (see runs/errors.ts). Absent before 1.6.0. */
+  errorKind?: string | null;
+  errorRaw?: string | null;
+  /** Sqlite failures this unit has been requeued for. */
+  sqliteRetries?: number;
+  /** Earliest time a requeued unit may start (sqlite backoff). */
+  notBefore?: number | null;
 }
 
 export type PoolStatus = "running" | "done" | "stopped" | "limit-stopped";
@@ -69,7 +78,15 @@ export interface PoolState {
     effective_cap: number;
     hits: number;
     backoff_until: number;
+    /** Slots taken off by sqlite failures and not yet restored. Absent before 1.6.0. */
+    sqlite_shrink?: number;
   }>;
+  /** Sqlite failures in a row with no success between them. */
+  consecutive_sqlite?: number;
+  /** Successes since the last sqlite failure, counted toward restoring a shrunk lane. */
+  sqlite_successes?: number;
+  /** Why scheduling is paused without stopping the pool (e.g. "disk_low"). */
+  paused_reason?: string | null;
 }
 
 export const POOLS_SUBDIR = "pools";
@@ -225,6 +242,8 @@ export function syncRunRecord(
     prompt_file: paths.prompt,
     log_file: paths.log,
     pool: poolId,
+    error_kind: unit.errorKind ?? null,
+    error_raw: unit.errorRaw ?? null,
   };
   store.save(record);
 }

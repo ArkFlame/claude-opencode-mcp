@@ -14,6 +14,13 @@ export const HUB_THRESHOLD = 8;
 export const PER_FILE_CAP_DEFAULT = 2;
 export const LIMIT_BACKOFF_MS = 120_000;
 export const CONSECUTIVE_LIMIT_STOP = 6;
+/** Sqlite failures in a row (no success between) that stop the pool. */
+export const SQLITE_CONSECUTIVE_STOP = 6;
+/** Successes needed to give back one slot taken by sqlite failures. */
+export const SQLITE_RESTORE_AFTER = 5;
+/** Requeue delay after a sqlite failure, multiplied by the unit's retry count. */
+export const SQLITE_BACKOFF_MS = 30_000;
+export const DEFAULT_MAX_RETRIES = 2;
 export const STALE_LOG_MS = 300_000;
 export const RATE_WINDOW_MS = 600_000;
 export const KILL_GRACE_MS = 5_000;
@@ -84,6 +91,8 @@ export interface LaneState {
   effectiveCap: number;
   hits: number;
   backoffUntil: number;
+  /** Slots taken off by sqlite failures that a later success may give back. */
+  sqliteShrink: number;
 }
 
 /** First lane (in config order) with a free slot that is not backing off. */
