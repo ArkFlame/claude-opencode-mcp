@@ -16,6 +16,7 @@ import { registerGetDiff } from "./tools/get-diff.js";
 import { registerGetSession } from "./tools/get-session.js";
 import { registerListAgents } from "./tools/list-agents.js";
 import { registerPoolTools } from "./tools/pool.js";
+import { registerQueueTools } from "./tools/queue.js";
 import { registerRunTools } from "./tools/runs.js";
 import { registerSendMessage } from "./tools/send-message.js";
 
@@ -95,6 +96,7 @@ export function createMcpServer(options: CreateMcpServerOptions): McpServer {
   registerListAgents(server, ctx);
   registerRunTools(server, ctx);
   registerPoolTools(server, ctx);
+  registerQueueTools(server, ctx);
 
   return server;
 }

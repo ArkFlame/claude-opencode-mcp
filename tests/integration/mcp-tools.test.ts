@@ -113,6 +113,9 @@ describe("MCP tool surface", () => {
       "get_diff",
       "abort_session",
       "list_agents",
+      "queue_message",
+      "list_messages",
+      "cancel_message",
     ]) {
       expect(names).toContain(expected);
     }

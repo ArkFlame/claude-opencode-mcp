@@ -11,7 +11,11 @@ function seconds(ms: number | null | undefined): number | null {
 }
 
 /** One compact row for list_runs. */
-export function runRow(record: RunRecord, now = Date.now()): Record<string, unknown> {
+export function runRow(
+  record: RunRecord,
+  now = Date.now(),
+  queuedMessages = 0,
+): Record<string, unknown> {
   const running = record.status === "running" || record.status === "queued";
   return {
     run_id: record.id,
@@ -23,11 +27,16 @@ export function runRow(record: RunRecord, now = Date.now()): Record<string, unkn
     branch: record.branch,
     attempts: record.attempts,
     last_line: record.last_line,
+    queued_messages: queuedMessages,
   };
 }
 
 /** Full view for get_run and for finished delegate results. Text is bounded to 16 KB. */
-export function runDetail(record: RunRecord, now = Date.now()): Record<string, unknown> {
+export function runDetail(
+  record: RunRecord,
+  now = Date.now(),
+  queuedMessages = 0,
+): Record<string, unknown> {
   const summary = summarizeFinal(record.final_text);
   const text = record.final_text ? boundText(record.final_text) : null;
   return {
@@ -54,6 +63,7 @@ export function runDetail(record: RunRecord, now = Date.now()): Record<string, u
       truncated: text?.truncated ?? false,
       original_bytes: text?.originalBytes ?? 0,
     },
+    queued_messages: queuedMessages,
     log_path: record.log_file,
   };
 }

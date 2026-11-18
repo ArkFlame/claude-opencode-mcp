@@ -4,6 +4,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { BridgeError } from "../../errors.js";
 import { requestAllPoolStops, requestUnitAbort } from "../../pool/launch.js";
+import { countQueued, inboxFileFor } from "../../queue/inbox.js";
 import { summaryLine } from "../../runs/manager.js";
 import { listModels } from "../../runs/models.js";
 import { assertRunName } from "../../runs/names.js";
@@ -64,7 +65,9 @@ export function registerRunTools(server: McpServer, ctx: AppContext): void {
         const rows = all
           .filter((record) => !args.status || record.status === args.status)
           .slice(0, args.limit ?? 50)
-          .map((record) => runRow(record, now));
+          .map((record) =>
+            runRow(record, now, countQueued(inboxFileFor(ctx.runs.store.dir, record.id))),
+          );
         return {
           summary_line: summaryLine(all, ctx.runs.maxParallel),
           slots: {
@@ -95,7 +98,11 @@ export function registerRunTools(server: McpServer, ctx: AppContext): void {
         if (!record) throw new BridgeError("INVALID_ARGUMENT", `Unknown run: ${args.run_id}`);
         const git = fs.existsSync(record.cwd) ? await gitSnapshot(record.cwd) : null;
         return {
-          ...runDetail(record),
+          ...runDetail(
+            record,
+            Date.now(),
+            countQueued(inboxFileFor(ctx.runs.store.dir, record.id)),
+          ),
           log_tail: readLogTail(record.log_file),
           git,
         };
