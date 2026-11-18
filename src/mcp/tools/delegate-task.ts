@@ -4,7 +4,13 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { BridgeError } from "../../errors.js";
 import { buildCliAgentConfig } from "../../runs/agent-config.js";
-import { buildPrompt, loadBriefHeader, validateReadPaths } from "../../runs/brief.js";
+import {
+  buildPrompt,
+  loadBriefHeader,
+  SHARED_BRIEF_HEADER,
+  validateForbid,
+  validateReadPaths,
+} from "../../runs/brief.js";
 import { summaryLine } from "../../runs/manager.js";
 import { listModels, resolveRunModel } from "../../runs/models.js";
 import { assertModelId, assertRunName } from "../../runs/names.js";
@@ -98,6 +104,19 @@ export function registerDelegateTask(server: McpServer, ctx: AppContext): void {
           .boolean()
           .optional()
           .describe("Allow this run to start while another run uses the same cwd (default false)."),
+        shared: z
+          .boolean()
+          .optional()
+          .describe(
+            "Shared-checkout mode: run directly in cwd (no worktree), allow concurrent runs there, and tell the worker not to run the forbid commands or commit (default false).",
+          ),
+        forbid: z
+          .array(z.string().max(40))
+          .max(20)
+          .optional()
+          .describe(
+            'Shared mode only: command names the worker must not run (default ["git", "cargo"]).',
+          ),
         allow_edits: z.boolean().optional().describe("Grant (true) or revoke (false) file edits."),
         allow_bash: z
           .boolean()
@@ -145,6 +164,8 @@ async function delegate(
     read_paths?: string[] | undefined;
     header?: boolean | undefined;
     allow_shared_cwd?: boolean | undefined;
+    shared?: boolean | undefined;
+    forbid?: string[] | undefined;
     allow_edits?: boolean | undefined;
     allow_bash?: boolean | undefined;
     timeout_seconds?: number | undefined;
@@ -153,6 +174,8 @@ async function delegate(
   requestIdValue: string,
 ) {
   const settings = ctx.runSettings;
+  const shared = args.shared === true;
+  const forbid = validateForbid(args.forbid);
   const requestedCwd = args.cwd?.trim() || ctx.env.CLAUDE_PROJECT_DIR?.trim() || process.cwd();
   const cwd = (() => {
     const resolved = path.resolve(requestedCwd);
@@ -184,12 +207,18 @@ async function delegate(
   const resolved = resolveRunModel(requestedModel, settings.model, listed);
 
   const readPaths = validateReadPaths(args.read_paths);
-  const header = args.header === false ? null : loadBriefHeader(settings.headerFile);
+  const header =
+    args.header === false
+      ? null
+      : shared && !settings.headerFile
+        ? SHARED_BRIEF_HEADER
+        : loadBriefHeader(settings.headerFile);
   const prompt = buildPrompt({
     header,
     task: args.task,
     brief: args.brief ?? null,
     readPaths,
+    shared: shared ? { forbid } : null,
   });
 
   const timeoutMs = args.timeout_seconds ? args.timeout_seconds * 1000 : settings.timeoutMs;
@@ -202,7 +231,7 @@ async function delegate(
     agentConfig: agentConfig.configContent,
     model: resolved.model,
     modelNote: resolved.note,
-    allowSharedCwd: args.allow_shared_cwd === true,
+    allowSharedCwd: args.allow_shared_cwd === true || shared,
     timeoutMs,
     idleMs: settings.idleMs,
   });

@@ -3,6 +3,7 @@ import path from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { BridgeError } from "../../errors.js";
+import { requestAllPoolStops, requestUnitAbort } from "../../pool/launch.js";
 import { summaryLine } from "../../runs/manager.js";
 import { listModels } from "../../runs/models.js";
 import { assertRunName } from "../../runs/names.js";
@@ -112,6 +113,9 @@ export function registerRunTools(server: McpServer, ctx: AppContext): void {
     },
     async (args) =>
       guard(async () => {
+        const stored = ctx.runs.store.get(args.run_id);
+        // Pool units also get an abort marker so their supervisor does not relaunch them.
+        if (stored?.pool) requestUnitAbort(stored);
         const record = ctx.runs.abort(args.run_id);
         if (!record) throw new BridgeError("INVALID_ARGUMENT", `Unknown run: ${args.run_id}`);
         await ctx.runs.waitForActive(ABORT_WAIT_MS);
@@ -135,10 +139,13 @@ export function registerRunTools(server: McpServer, ctx: AppContext): void {
     },
     async () =>
       guard(async () => {
+        // Stop pool supervisors first so they do not relaunch the workers killed below.
+        const poolsStopped = requestAllPoolStops(ctx.runSettings.runsDir);
         const result = ctx.runs.abortAll();
         await ctx.runs.waitForActive(ABORT_WAIT_MS);
         return {
           ...result,
+          pools_stopped: poolsStopped,
           summary_line: summaryLine(ctx.runs.store.list(), ctx.runs.maxParallel),
         };
       }),

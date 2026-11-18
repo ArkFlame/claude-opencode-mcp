@@ -15,6 +15,7 @@ import { registerDelegateTask } from "./tools/delegate-task.js";
 import { registerGetDiff } from "./tools/get-diff.js";
 import { registerGetSession } from "./tools/get-session.js";
 import { registerListAgents } from "./tools/list-agents.js";
+import { registerPoolTools } from "./tools/pool.js";
 import { registerRunTools } from "./tools/runs.js";
 import { registerSendMessage } from "./tools/send-message.js";
 
@@ -41,6 +42,7 @@ export const SERVER_INSTRUCTIONS = [
   "Read-only agents: deepseek-researcher, deepseek-reviewer. Editing agent: deepseek-coder. Test-running agent: deepseek-tester.",
   "After a coder session, call get_diff to inspect exactly what changed before reporting back to the user.",
   "Paths supplied to delegate_task are exploration hints, not boundaries.",
+  "Shared checkouts: delegate_task with shared=true, or run_pool for a batch of unit files (pool_status to follow, usage_stats for model figures, auto_commit to commit and push while workers edit).",
 ].join(" ");
 
 export interface CreateMcpServerOptions {
@@ -92,6 +94,7 @@ export function createMcpServer(options: CreateMcpServerOptions): McpServer {
   registerAbortSession(server, ctx);
   registerListAgents(server, ctx);
   registerRunTools(server, ctx);
+  registerPoolTools(server, ctx);
 
   return server;
 }
