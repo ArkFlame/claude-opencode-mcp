@@ -8,15 +8,39 @@ import { countQueued, inboxFileFor } from "../../queue/inbox.js";
 import { summaryLine } from "../../runs/manager.js";
 import { listModels } from "../../runs/models.js";
 import { assertRunName } from "../../runs/names.js";
-import { RUN_STATUSES } from "../../runs/store.js";
+import {
+  assertMutable,
+  filterByScope,
+  type OwnedRecord,
+  ownershipOf,
+  type RunOwner,
+  summarizeOwners,
+} from "../../runs/owner.js";
+import { RUN_STATUSES, type RunRecord } from "../../runs/store.js";
 import { gitSnapshot, readLogTail, runDetail, runRow } from "../../runs/view.js";
 import { createWorktree, removeWorktree } from "../../runs/worktree.js";
 import { requestId } from "../../util/text.js";
 import type { AppContext } from "../execute.js";
 import { errorResult, jsonResult } from "../tool-utils.js";
+import { FORCE_PARAM, SCOPE_PARAM } from "./owner-params.js";
 
 /** How long abort tools wait for SIGTERM/SIGKILL to finish the process groups. */
 const ABORT_WAIT_MS = 8_000;
+
+/** Owner columns added to run rows: who owns it and whether this session does. */
+export function ownerFields(record: OwnedRecord, me: RunOwner) {
+  const view = ownershipOf(record, me);
+  return {
+    owner_id: view.owner_id,
+    owner_label: view.owner_label,
+    mine: view.mine,
+    foreign: view.foreign,
+  };
+}
+
+function isForeign(record: RunRecord | null, me: RunOwner): boolean {
+  return record !== null && ownershipOf(record, me).foreign;
+}
 
 const RUN_ID = z
   .string()
@@ -55,26 +79,32 @@ export function registerRunTools(server: McpServer, ctx: AppContext): void {
       inputSchema: {
         status: z.enum(RUN_STATUSES).optional().describe("Only runs with this status."),
         limit: z.number().int().min(1).max(200).optional().describe("Max rows (default 50)."),
+        scope: SCOPE_PARAM,
       },
       annotations: { readOnlyHint: true },
     },
     async (args) =>
       guard(async () => {
         const now = Date.now();
-        const all = ctx.runs.store.list();
+        const scope = args.scope ?? "mine";
+        const me = ctx.runs.owner;
+        const all = filterByScope(ctx.runs.store.list(), scope, me);
         const rows = all
           .filter((record) => !args.status || record.status === args.status)
           .slice(0, args.limit ?? 50)
-          .map((record) =>
-            runRow(record, now, countQueued(inboxFileFor(ctx.runs.store.dir, record.id))),
-          );
+          .map((record) => ({
+            ...runRow(record, now, countQueued(inboxFileFor(ctx.runs.store.dir, record.id))),
+            ...ownerFields(record, me),
+          }));
         return {
+          scope,
           summary_line: summaryLine(all, ctx.runs.maxParallel),
           slots: {
             running: ctx.runs.activeCount(),
             queued: ctx.runs.queuedCount(),
             max_parallel: ctx.runs.maxParallel,
           },
+          ...(scope === "all" ? { owners: summarizeOwners(all, me) } : {}),
           runs: rows,
         };
       }),
@@ -98,6 +128,7 @@ export function registerRunTools(server: McpServer, ctx: AppContext): void {
         if (!record) throw new BridgeError("INVALID_ARGUMENT", `Unknown run: ${args.run_id}`);
         const git = fs.existsSync(record.cwd) ? await gitSnapshot(record.cwd) : null;
         return {
+          ...ownerFields(record, ctx.runs.owner),
           ...runDetail(
             record,
             Date.now(),
@@ -115,12 +146,13 @@ export function registerRunTools(server: McpServer, ctx: AppContext): void {
       title: "Abort a run",
       description:
         "Abort one run: queued runs are dropped, running ones get SIGTERM then SIGKILL for their whole process group.",
-      inputSchema: { run_id: RUN_ID },
+      inputSchema: { run_id: RUN_ID, force: FORCE_PARAM },
       annotations: { destructiveHint: true },
     },
     async (args) =>
       guard(async () => {
         const stored = ctx.runs.store.get(args.run_id);
+        if (stored) assertMutable(stored, ctx.runs.owner, args.force);
         // Pool units also get an abort marker so their supervisor does not relaunch them.
         if (stored?.pool) requestUnitAbort(stored);
         const record = ctx.runs.abort(args.run_id);
@@ -140,18 +172,34 @@ export function registerRunTools(server: McpServer, ctx: AppContext): void {
     {
       title: "Abort all runs",
       description:
-        "Abort every queued and running run owned by this server and reap any stale run records.",
-      inputSchema: {},
+        "Abort every queued and running run of this Claude session and reap its stale run records. Other sessions' runs are left alone unless scope is all and force is true.",
+      inputSchema: { scope: SCOPE_PARAM, force: FORCE_PARAM },
       annotations: { destructiveHint: true },
     },
-    async () =>
+    async (args) =>
       guard(async () => {
+        const scope = args.scope ?? "mine";
+        const me = ctx.runs.owner;
+        if (scope === "all" && args.force !== true) {
+          throw new BridgeError(
+            "PERMISSION_DENIED",
+            "abort_all with scope all also aborts other sessions' runs; pass force: true to confirm.",
+          );
+        }
+        const includeForeign = scope === "all";
         // Stop pool supervisors first so they do not relaunch the workers killed below.
-        const poolsStopped = requestAllPoolStops(ctx.runSettings.runsDir);
-        const result = ctx.runs.abortAll();
+        const poolsStopped = requestAllPoolStops(
+          ctx.runSettings.runsDir,
+          (state) =>
+            includeForeign ||
+            !ownershipOf({ owner_id: state.owner_id, owner_pid: state.supervisor_pid ?? 0 }, me)
+              .foreign,
+        );
+        const result = ctx.runs.abortAll({ scope, ...(args.force ? { force: true } : {}) });
         await ctx.runs.waitForActive(ABORT_WAIT_MS);
         return {
           ...result,
+          scope,
           pools_stopped: poolsStopped,
           summary_line: summaryLine(ctx.runs.store.list(), ctx.runs.maxParallel),
         };
@@ -173,14 +221,27 @@ export function registerRunTools(server: McpServer, ctx: AppContext): void {
           .max(110)
           .optional()
           .describe("Max wait in seconds (default 60, max 110)."),
+        scope: SCOPE_PARAM,
       },
       annotations: { readOnlyHint: true },
     },
     async (args) =>
       guard(async () => {
-        const waited = await ctx.runs.waitAny(args.run_ids, args.seconds ?? 60);
+        const scope = args.scope ?? "mine";
+        const me = ctx.runs.owner;
+        // Foreign run ids are not waited on under scope mine; they are reported instead.
+        const skippedForeign = args.run_ids.filter(
+          (id) => scope === "mine" && isForeign(ctx.runs.store.get(id), me),
+        );
+        const ids = args.run_ids.filter((id) => !skippedForeign.includes(id));
+        const waited = await ctx.runs.waitAny(ids, args.seconds ?? 60);
         return {
-          finished: waited.finished.map((record) => runDetail(record)),
+          scope,
+          skipped_foreign: skippedForeign,
+          finished: waited.finished.map((record) => ({
+            ...runDetail(record),
+            ...ownerFields(record, me),
+          })),
           pending: waited.pending,
           unknown: waited.unknown,
           timed_out: waited.timed_out,

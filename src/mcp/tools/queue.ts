@@ -21,9 +21,11 @@ import {
 } from "../../queue/inbox.js";
 import { drainSessionInbox, scheduleSessionRetry } from "../../queue/session-delivery.js";
 import { type QueueTarget, resolveQueueTarget } from "../../queue/target.js";
+import { assertMutable } from "../../runs/owner.js";
 import { requestId } from "../../util/text.js";
 import type { AppContext } from "../execute.js";
 import { errorResult, jsonResult } from "../tool-utils.js";
+import { FORCE_PARAM, SCOPE_PARAM } from "./owner-params.js";
 
 const LIST_DEFAULT = 50;
 const LIST_MAX = 200;
@@ -82,12 +84,21 @@ export function registerQueueTools(server: McpServer, ctx: AppContext): void {
           .max(MAX_PRIORITY)
           .optional()
           .describe("Higher delivers first (default 0)."),
+        force: FORCE_PARAM,
       },
       annotations: { openWorldHint: true },
     },
-    async (args: { run_id: string; message: string; mode?: MessageMode; priority?: number }) =>
+    async (args: {
+      run_id: string;
+      message: string;
+      mode?: MessageMode;
+      priority?: number;
+      force?: boolean;
+    }) =>
       guard(async () => {
         const mode: MessageMode = args.mode ?? "when_idle";
+        const stored = ctx.runs.store.get(args.run_id);
+        if (stored) assertMutable(stored, ctx.runs.owner, args.force);
         const target = resolveQueueTarget(sources(ctx), args.run_id);
         if (target.status === "aborted" && mode !== "now") {
           throw new BridgeError(
@@ -100,6 +111,7 @@ export function registerQueueTools(server: McpServer, ctx: AppContext): void {
           mode,
           ...(args.priority !== undefined ? { priority: args.priority } : {}),
           now: Date.now(),
+          ownerId: ctx.runs.owner.id,
         });
         ctx.logger.info("message queued", {
           run_id: args.run_id,
@@ -131,27 +143,34 @@ export function registerQueueTools(server: McpServer, ctx: AppContext): void {
       inputSchema: {
         run_id: RUN_ID.optional(),
         limit: z.number().int().min(1).max(LIST_MAX).optional().describe("Max rows (default 50)."),
+        scope: SCOPE_PARAM,
       },
       annotations: { readOnlyHint: true },
     },
-    async (args: { run_id?: string; limit?: number }) =>
+    async (args: { run_id?: string; limit?: number; scope?: "mine" | "all" }) =>
       guard(async () => {
+        const scope = args.scope ?? "mine";
+        const me = ctx.runs.owner;
         const files = args.run_id
           ? [inboxFileFor(ctx.runSettings.runsDir, args.run_id)]
           : listInboxFiles(ctx.runSettings.runsDir);
         const rows = files.flatMap((file) =>
-          readInbox(file).map((message) => ({
-            queued_id: message.id,
-            run_id: runIdOfInbox(file),
-            status: message.status,
-            mode: message.mode,
-            priority: message.priority,
-            ts: new Date(message.ts).toISOString(),
-            attempts: message.attempts,
-            in_flight: message.in_flight,
-            last_error: message.last_error,
-            preview: messagePreview(message.text),
-          })),
+          readInbox(file)
+            .filter((message) => scope === "all" || message.owner_id === me.id)
+            .map((message) => ({
+              queued_id: message.id,
+              run_id: runIdOfInbox(file),
+              owner_id: message.owner_id ?? null,
+              mine: message.owner_id === me.id,
+              status: message.status,
+              mode: message.mode,
+              priority: message.priority,
+              ts: new Date(message.ts).toISOString(),
+              attempts: message.attempts,
+              in_flight: message.in_flight,
+              last_error: message.last_error,
+              preview: messagePreview(message.text),
+            })),
         );
         rows.sort((a, b) => b.ts.localeCompare(a.ts));
         return { messages: rows.slice(0, args.limit ?? LIST_DEFAULT) };
@@ -169,15 +188,24 @@ export function registerQueueTools(server: McpServer, ctx: AppContext): void {
           .string()
           .regex(MESSAGE_ID_PATTERN)
           .describe("Queued message id returned by queue_message."),
+        force: FORCE_PARAM,
       },
       annotations: { destructiveHint: true },
     },
-    async (args: { queued_id: string }) =>
+    async (args: { queued_id: string; force?: boolean }) =>
       guard(async () => {
         const file = listInboxFiles(ctx.runSettings.runsDir).find((candidate) =>
           readInbox(candidate).some((message) => message.id === args.queued_id),
         );
         if (!file) throw new BridgeError("INVALID_ARGUMENT", `Unknown message: ${args.queued_id}`);
+        const owned = readInbox(file).find((message) => message.id === args.queued_id);
+        if (owned) {
+          assertMutable(
+            { id: owned.id, owner_id: owned.owner_id ?? null, owner_pid: 0 },
+            ctx.runs.owner,
+            args.force,
+          );
+        }
         const message = cancelMessage(file, args.queued_id);
         return { queued_id: message.id, run_id: runIdOfInbox(file), status: message.status };
       }),

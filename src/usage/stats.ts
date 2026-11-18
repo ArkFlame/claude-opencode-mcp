@@ -48,11 +48,26 @@ export function titlePrefixClause(prefix: string | undefined): string {
   return ` AND s.title LIKE '${escaped}%' ESCAPE '\\'`;
 }
 
-export function buildUsageSql(limit: number, prefix: string | undefined): string {
+/**
+ * Restrict to sessions whose title carries one of the given run ids, as delegate_task titles them
+ * `<name> (<run id>)`. Ids outside the safe pattern are dropped; an empty list matches nothing.
+ */
+export function runIdClause(runIds: string[] | undefined): string {
+  if (!runIds) return "";
+  const safe = runIds.filter((id) => /^[A-Za-z0-9._:-]{1,200}$/.test(id));
+  if (safe.length === 0) return " AND 0";
+  return ` AND (${safe.map((id) => `s.title LIKE '%(${id})%'`).join(" OR ")})`;
+}
+
+export function buildUsageSql(
+  limit: number,
+  prefix: string | undefined,
+  runIds?: string[] | undefined,
+): string {
   return [
     "SELECT m.session_id AS session_id, s.title AS title, m.data AS data",
     "FROM session_message m JOIN session_v2 s ON s.id = m.session_id",
-    `WHERE m.type = 'assistant'${titlePrefixClause(prefix)}`,
+    `WHERE m.type = 'assistant'${titlePrefixClause(prefix)}${runIdClause(runIds)}`,
     `ORDER BY m.time_created DESC LIMIT ${Math.trunc(limit)}`,
   ].join(" ");
 }
@@ -226,6 +241,8 @@ export async function usageReport(options: {
   titlePrefix?: string | undefined;
   limit?: number | undefined;
   env?: NodeJS.ProcessEnv;
+  /** Only sessions titled with these run ids (scope mine). Omit for every session. */
+  runIds?: string[] | undefined;
 }): Promise<UsageReport> {
   const dbPath = path.resolve(options.dbPath ?? defaultOpencodeDb(options.env));
   if (!fs.existsSync(dbPath) || !fs.statSync(dbPath).isFile()) {
@@ -234,7 +251,7 @@ export async function usageReport(options: {
   const limit = Math.min(Math.max(options.limit ?? DEFAULT_USAGE_LIMIT, 1), MAX_USAGE_LIMIT);
   const rows = (await runReadOnlyQuery(
     dbPath,
-    buildUsageSql(limit, options.titlePrefix),
+    buildUsageSql(limit, options.titlePrefix, options.runIds),
   )) as unknown as UsageRow[];
   const models = summarizeUsage(rows);
   const sessions = new Set(rows.map((row) => row.session_id));

@@ -5,6 +5,7 @@ import type { LoadedConfig, ResolvedConfig } from "../config/config.js";
 import type { OpenCodeManager } from "../opencode/manager.js";
 import type { SessionRegistry } from "../opencode/sessions.js";
 import { RunManager } from "../runs/manager.js";
+import { applyClientName } from "../runs/owner.js";
 import { type RunSettings, resolveRunSettings } from "../runs/settings.js";
 import { RunStore } from "../runs/store.js";
 import type { Logger } from "../util/logger.js";
@@ -19,6 +20,7 @@ import { registerPoolTools } from "./tools/pool.js";
 import { registerQueueTools } from "./tools/queue.js";
 import { registerRunTools } from "./tools/runs.js";
 import { registerSendMessage } from "./tools/send-message.js";
+import { registerWhoami } from "./tools/whoami.js";
 
 export const SERVER_NAME = "claude-opencode-mcp";
 
@@ -97,6 +99,11 @@ export function createMcpServer(options: CreateMcpServerOptions): McpServer {
   registerRunTools(server, ctx);
   registerPoolTools(server, ctx);
   registerQueueTools(server, ctx);
+  registerWhoami(server, ctx);
+  // The MCP client name becomes part of this session's owner label once it initializes.
+  server.server.oninitialized = () => {
+    applyClientName(runs.owner, server.server.getClientVersion()?.name, env);
+  };
 
   return server;
 }

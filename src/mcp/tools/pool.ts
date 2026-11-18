@@ -5,17 +5,25 @@ import { z } from "zod";
 import { BridgeError } from "../../errors.js";
 import { AutoCommitter, MAX_INTERVAL_S, MIN_INTERVAL_S } from "../../git/auto-commit.js";
 import { PER_FILE_CAP_DEFAULT } from "../../pool/core.js";
-import { listPoolDirs, startPool } from "../../pool/launch.js";
-import { type LaneConfig, type PoolConfig, poolDirFor, poolIdFor } from "../../pool/state.js";
+import { isSupervisorAlive, listPoolDirs, startPool } from "../../pool/launch.js";
+import {
+  type LaneConfig,
+  type PoolConfig,
+  poolDirFor,
+  poolIdFor,
+  readPoolState,
+} from "../../pool/state.js";
 import { buildPoolStatus } from "../../pool/status.js";
 import { scanUnits, splitUnitsGlob } from "../../pool/units.js";
 import { validateForbid } from "../../runs/brief.js";
 import { assertModelId, assertRunName } from "../../runs/names.js";
+import { assertMutable, filterByScope, ownershipOf, type RunOwner } from "../../runs/owner.js";
 import { assertInsideRoots, defaultAllowedRoot, repoRootOf } from "../../runs/worktree.js";
 import { DEFAULT_USAGE_LIMIT, MAX_USAGE_LIMIT, usageReport } from "../../usage/stats.js";
 import { requestId } from "../../util/text.js";
 import type { AppContext } from "../execute.js";
 import { errorResult, jsonResult } from "../tool-utils.js";
+import { FORCE_PARAM, SCOPE_PARAM } from "./owner-params.js";
 
 const MAX_BRIEF_BYTES = 100 * 1024;
 const MAX_LANES = 10;
@@ -60,6 +68,25 @@ function readBriefTemplate(file: string): string {
     throw new BridgeError("INVALID_ARGUMENT", `brief template exceeds ${MAX_BRIEF_BYTES} bytes.`);
   }
   return fs.readFileSync(file, "utf8");
+}
+
+/** Ownership of a pool, read from its state file. Legacy pools are owned by their supervisor pid. */
+function poolOwnership(dir: string, me: RunOwner) {
+  const state = readPoolState(dir);
+  const view = ownershipOf(
+    {
+      owner_id: state?.owner_id ?? null,
+      owner_label: state?.owner_label ?? null,
+      owner_pid: state?.supervisor_pid ?? 0,
+    },
+    me,
+  );
+  return {
+    owner_id: view.owner_id,
+    owner_label: view.owner_label,
+    mine: view.mine,
+    foreign: view.foreign,
+  };
 }
 
 export function registerPoolTools(server: McpServer, ctx: AppContext): void {
@@ -128,6 +155,7 @@ export function registerPoolTools(server: McpServer, ctx: AppContext): void {
           .max(20)
           .optional()
           .describe('Commands workers must not run (default ["git", "cargo"]).'),
+        force: FORCE_PARAM,
       },
       annotations: { openWorldHint: true },
     },
@@ -159,9 +187,24 @@ export function registerPoolTools(server: McpServer, ctx: AppContext): void {
           runsDir: ctx.runSettings.runsDir,
           poolDir: poolDirFor(ctx.runSettings.runsDir, id),
           createdAt: Date.now(),
+          ownerId: ctx.runs.owner.id,
+          ownerLabel: ctx.runs.owner.label,
         };
         const units = scanUnits(args.units_glob);
         const open = units.filter((unit) => unit.text.includes(args.marker));
+        const prior = readPoolState(config.poolDir);
+        if (prior?.status === "running" && isSupervisorAlive(prior.supervisor_pid)) {
+          assertMutable(
+            {
+              id,
+              owner_id: prior.owner_id ?? null,
+              owner_label: prior.owner_label ?? null,
+              owner_pid: prior.supervisor_pid ?? 0,
+            },
+            ctx.runs.owner,
+            args.force,
+          );
+        }
         const started = startPool(config);
         return {
           ...started,
@@ -190,16 +233,25 @@ export function registerPoolTools(server: McpServer, ctx: AppContext): void {
           .max(50)
           .optional()
           .describe("Pools to list when pool_id is omitted (default 10)."),
+        scope: SCOPE_PARAM,
       },
       annotations: { readOnlyHint: true },
     },
     async (args) =>
       guard(async () => {
+        const me = ctx.runs.owner;
         if (args.pool_id) {
-          return buildPoolStatus(poolDirFor(ctx.runSettings.runsDir, args.pool_id));
+          const dir = poolDirFor(ctx.runSettings.runsDir, args.pool_id);
+          return { ...buildPoolStatus(dir), ...poolOwnership(dir, me) };
         }
-        const dirs = listPoolDirs(ctx.runSettings.runsDir).slice(0, args.limit ?? 10);
-        return { pools: dirs.map((dir) => buildPoolStatus(dir)) };
+        const scope = args.scope ?? "mine";
+        const dirs = listPoolDirs(ctx.runSettings.runsDir)
+          .filter((dir) => scope === "all" || poolOwnership(dir, me).mine)
+          .slice(0, args.limit ?? 10);
+        return {
+          scope,
+          pools: dirs.map((dir) => ({ ...buildPoolStatus(dir), ...poolOwnership(dir, me) })),
+        };
       }),
   );
 
@@ -229,18 +281,25 @@ export function registerPoolTools(server: McpServer, ctx: AppContext): void {
           .max(4_096)
           .optional()
           .describe("Absolute path to an opencode.db (default: the user's)."),
+        scope: SCOPE_PARAM,
       },
       annotations: { readOnlyHint: true },
     },
     async (args) =>
-      guard(async () =>
-        usageReport({
+      guard(async () => {
+        const scope = args.scope ?? "mine";
+        const runIds =
+          scope === "mine"
+            ? filterByScope(ctx.runs.store.list(), "mine", ctx.runs.owner).map((run) => run.id)
+            : undefined;
+        return usageReport({
           dbPath: args.db_path,
           titlePrefix: args.title_prefix,
           limit: args.limit,
           env: ctx.env,
-        }),
-      ),
+          runIds,
+        });
+      }),
   );
 
   server.registerTool(

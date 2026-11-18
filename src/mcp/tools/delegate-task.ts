@@ -262,11 +262,22 @@ async function delegate(
         ? "all slots busy. Call wait_any on active run_ids, then delegate again."
         : `${maxParallel - running} slot(s) free.`;
 
+  // Another Claude session running in this cwd blocks an exclusive run exactly as a local run does.
+  const holder = record.allow_shared_cwd ? null : ctx.runs.collisionFor(cwd);
+  const collision = holder
+    ? {
+        run_id: holder.id,
+        owner_label: holder.owner_label ?? holder.owner_id ?? "another session",
+        message: `cwd is busy with run ${holder.id} of ${holder.owner_label ?? "another session"}; this run waits for it unless allow_shared_cwd is set.`,
+      }
+    : null;
+
   return jsonResult({
     run_id: record.id,
     name,
     status: current.status,
     queue_position: position,
+    collision,
     agent: agentConfig.agent,
     model: resolved.model,
     model_note: resolved.note,
