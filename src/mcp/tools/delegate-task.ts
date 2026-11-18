@@ -11,7 +11,7 @@ import {
   validateForbid,
   validateReadPaths,
 } from "../../runs/brief.js";
-import { summaryLine } from "../../runs/manager.js";
+import { DEFAULT_QUEUE_TTL_MS, summaryLine } from "../../runs/manager.js";
 import { listModels, resolveRunModel } from "../../runs/models.js";
 import { assertModelId, assertRunName } from "../../runs/names.js";
 import { runDetail, runRow } from "../../runs/view.js";
@@ -130,6 +130,15 @@ export function registerDelegateTask(server: McpServer, ctx: AppContext): void {
           .max(86_400)
           .optional()
           .describe("Hard timeout for this run in seconds (default from CLAUDE_OPENCODE_TIMEOUT)."),
+        queue_ttl_seconds: z
+          .number()
+          .int()
+          .positive()
+          .max(86_400)
+          .optional()
+          .describe(
+            "How long this run may wait queued for a free slot before it is reaped (default: timeout_seconds, else 3600).",
+          ),
         wait_seconds: z
           .number()
           .int()
@@ -153,6 +162,16 @@ export function registerDelegateTask(server: McpServer, ctx: AppContext): void {
   );
 }
 
+/** Queue wait: explicit queue_ttl_seconds, else timeout_seconds, else one hour. */
+function queueTtl(args: {
+  queue_ttl_seconds?: number | undefined;
+  timeout_seconds?: number | undefined;
+}): number {
+  if (args.queue_ttl_seconds) return args.queue_ttl_seconds * 1000;
+  if (args.timeout_seconds) return args.timeout_seconds * 1000;
+  return DEFAULT_QUEUE_TTL_MS;
+}
+
 async function delegate(
   ctx: AppContext,
   args: {
@@ -171,6 +190,7 @@ async function delegate(
     allow_bash?: boolean | undefined;
     timeout_seconds?: number | undefined;
     wait_seconds?: number | undefined;
+    queue_ttl_seconds?: number | undefined;
   },
   requestIdValue: string,
 ) {
@@ -236,6 +256,7 @@ async function delegate(
     allowSharedCwd: args.allow_shared_cwd === true || shared,
     timeoutMs,
     idleMs: settings.idleMs,
+    queueTtlMs: queueTtl(args),
   });
   ctx.logger.info("run queued", {
     request_id: requestIdValue,

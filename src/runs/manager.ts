@@ -20,7 +20,10 @@ import {
 
 /** A run may outlive its own deadline by this much before the reaper treats it as stuck. */
 const REAP_MARGIN_MS = 60_000;
-const REAP_INTERVAL_MS = 60_000;
+/** Reaper and slot reconciliation period. Short so dead runs free their slot promptly. */
+const REAP_INTERVAL_MS = 10_000;
+/** Queue wait allowed when the caller gave no timeout_seconds: one hour. */
+export const DEFAULT_QUEUE_TTL_MS = 3_600_000;
 const PERSIST_THROTTLE_MS = 5_000;
 const WAIT_TICK_MS = 2_000;
 
@@ -36,6 +39,8 @@ export interface SubmitInput {
   allowSharedCwd: boolean;
   timeoutMs: number;
   idleMs: number;
+  /** Longest a run may wait queued before it is reaped. Defaults to DEFAULT_QUEUE_TTL_MS. */
+  queueTtlMs?: number;
 }
 
 interface Job {
@@ -86,6 +91,16 @@ export function summaryLine(records: RunRecord[], maxParallel: number): string {
     .filter((status) => counts[status])
     .map((status) => `${counts[status]} ${status}`);
   return `${parts.join(", ") || "no runs"} (max parallel ${maxParallel})`;
+}
+
+/** Hard limit of one run, from its process start: its own timeout, else the settings default. */
+export function hardLimitOf(record: RunRecord, defaultMs: number): number {
+  return (record.timeout_ms ?? defaultMs) + REAP_MARGIN_MS;
+}
+
+/** How long a queued run may wait: its own TTL, else its timeout, else the settings default. */
+export function queueTtlOf(record: RunRecord, defaultMs: number): number {
+  return record.queue_ttl_ms ?? record.timeout_ms ?? Math.max(defaultMs, DEFAULT_QUEUE_TTL_MS);
 }
 
 export class RunManager {
@@ -161,6 +176,9 @@ export class RunManager {
       error: null,
       prompt_file: promptFile,
       log_file: path.join(dir, `${id}.log`),
+      timeout_ms: input.timeoutMs,
+      idle_ms: input.idleMs,
+      queue_ttl_ms: input.queueTtlMs ?? DEFAULT_QUEUE_TTL_MS,
     };
     this.store.save(record);
     this.queue.push({ record, input, abort: new AbortController(), lastPersist: 0 });
@@ -386,13 +404,24 @@ export class RunManager {
     return { queued, running, reaped };
   }
 
-  /** Mark orphaned or overdue runs stale and kill their process groups. Returns the count. */
+  /**
+   * Mark orphaned, overdue or queue-expired runs stale and kill their process groups. Returns the
+   * count. The hard timeout counts from process start and uses the run's own limit. A queued run
+   * never hits it: it has its own queue TTL, and a live queue owned by another process is left alone.
+   */
   reapStale(now = Date.now()): number {
     let count = 0;
-    const hardLimit = this.options.settings.timeoutMs + REAP_MARGIN_MS;
     for (const record of this.store.list()) {
       if (isTerminal(record.status) || this.active.has(record.id)) continue;
-      if (this.queue.some((job) => job.record.id === record.id)) continue;
+      const queued = this.queue.find((job) => job.record.id === record.id);
+      if (queued) {
+        if (now - record.created > queueTtlOf(record, this.options.settings.timeoutMs)) {
+          this.queue = this.queue.filter((job) => job !== queued);
+          this.reapRecord(record, "queue ttl exceeded before start; run reaped", "stale");
+          count += 1;
+        }
+        continue;
+      }
       if (record.pool) {
         // Pool workers belong to their supervisor. Reap only when neither it nor the worker lives.
         const pgid = record.pgid ?? record.pid;
@@ -407,12 +436,19 @@ export class RunManager {
       // Only a dead owner makes a run stale. A live other session's run is never touched.
       const ownerGone = !isProcessAlive(record.owner_pid) && !this.adopt(record);
       if (view.foreign && !ownerGone) continue;
-      const orphanQueued = view.mine && record.status === "queued";
-      const overdue = view.mine && record.started !== null && now - record.started > hardLimit;
-      if (!ownerGone && !orphanQueued && !overdue) continue;
+      // A queued record whose owner is this process but that is not in this queue lost its queue.
+      // A live sibling process of the same session keeps its own queue, so its records stay.
+      const lostQueue =
+        record.status === "queued" && record.owner_pid === this.ownerPid && view.mine;
+      const overdue =
+        view.mine &&
+        record.status === "running" &&
+        record.started !== null &&
+        now - record.started > hardLimitOf(record, this.options.settings.timeoutMs);
+      if (!ownerGone && !lostQueue && !overdue) continue;
       const reason = ownerGone
         ? "owner process exited; run reaped"
-        : orphanQueued
+        : lostQueue
           ? "queued run lost its queue; run reaped"
           : "exceeded hard timeout; run reaped";
       this.reapRecord(record, reason, "stale");
