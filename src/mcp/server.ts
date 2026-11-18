@@ -40,7 +40,7 @@ export const SERVER_VERSION = resolveServerVersion();
 export const SERVER_INSTRUCTIONS = [
   "Claude Code is the orchestrator; this server runs OpenCode agents in the background, in the same workspace or in git worktrees.",
   "Start work with create_worktree (optional) then delegate_task, which returns a run_id at once. Collect results with wait_any and get_run; check list_runs before declaring the fleet idle and abort_run or abort_all stale runs.",
-  "Up to CLAUDE_OPENCODE_MAX_PARALLEL runs execute at once (default 10); extra runs queue FIFO. Use list_models to see valid model ids.",
+  "Up to CLAUDE_OPENCODE_MAX_PARALLEL runs execute at once (default 10); extra runs queue FIFO and launches ramp up automatically (CLAUDE_OPENCODE_RAMP_*). Use list_models to see valid model ids.",
   "create_session + send_message remain available for multi-step conversations that must keep context.",
   "Read-only agents: deepseek-researcher, deepseek-reviewer. Editing agent: deepseek-coder. Test-running agent: deepseek-tester.",
   "After a coder session, call get_diff to inspect exactly what changed before reporting back to the user.",

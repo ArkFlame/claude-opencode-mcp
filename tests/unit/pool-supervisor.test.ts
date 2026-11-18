@@ -384,6 +384,9 @@ describe("run store mirror", () => {
 
 const SQLITE_LOG =
   'step_start\n{"type":"error","error":{"data":{"message":"Failed to execute statement"}}}\n';
+// Sqlite-class but not transient, so it still counts toward the consecutive stop.
+const SQLITE_FULL_LOG =
+  'step_start\n{"type":"error","error":{"data":{"message":"write failed: ENOSPC"}}}\n';
 
 describe("sqlite failures", () => {
   it("requeues a unit with backoff, shrinks its lane by one, and relaunches it", () => {
@@ -418,7 +421,7 @@ describe("sqlite failures", () => {
     const { ops, supervisor } = boot(units, { maxRetries: 10 });
     for (const name of names) {
       supervisor.tick();
-      ops.end(name, 1, SQLITE_LOG);
+      ops.end(name, 1, SQLITE_FULL_LOG);
     }
     supervisor.tick();
     expect(supervisor.poolStatus()).toBe("limit-stopped");

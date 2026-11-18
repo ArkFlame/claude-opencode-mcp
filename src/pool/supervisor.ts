@@ -17,6 +17,7 @@ import { buildResumeArgs, findSessionIdByTitle, unitSessionTitles } from "../que
 import { sharedSection } from "../runs/brief.js";
 import { classifySqlite, extractErrorLine } from "../runs/errors.js";
 import { buildRunArgs } from "../runs/manager.js";
+import { isTransientError, RampGate, rampConfigFromEnv } from "../runs/ramp.js";
 import { isProcessAlive, killProcessGroup, RunStore } from "../runs/store.js";
 import { findLowDisk, freeMbAt, type LowDisk, minFreeMb, opencodeDataDir } from "../util/disk.js";
 import {
@@ -123,6 +124,8 @@ export class PoolSupervisor {
   private readonly failureTimes: number[] = [];
   private lastRamp = Number.NEGATIVE_INFINITY;
   private rampPauseUntil = Number.NEGATIVE_INFINITY;
+  /** Automatic staggered start for launches (CLAUDE_OPENCODE_RAMP_*). */
+  private readonly admission = new RampGate(rampConfigFromEnv(process.env));
   /** Unit files seen without an open marker, with the mtime they had when checked. */
   private readonly closedAt = new Map<string, number>();
 
@@ -679,14 +682,17 @@ export class PoolSupervisor {
       this.limitHit(unit, now);
       return;
     }
-    const sqlite = exitCode === 0 ? null : classifySqlite(tail);
+    const transient = exitCode !== 0 && isTransientError(tail);
+    const sqlite =
+      exitCode === 0 ? null : (classifySqlite(tail) ?? (transient ? "sqlite_other" : null));
     if (sqlite) {
       this.settleMessage(unit.key, message, false, sqlite, now);
-      this.sqliteHit(unit, exitCode, sqlite, extractErrorLine(tail), now);
+      this.sqliteHit(unit, exitCode, sqlite, extractErrorLine(tail), now, transient);
       return;
     }
     const error = exitCode === 0 ? null : exitCode === null ? "worker lost" : `exit ${exitCode}`;
     this.settleMessage(unit.key, message, exitCode === 0, error, now);
+    this.admission.noteOk();
     unit.exitCode = exitCode;
     unit.errorKind = null;
     unit.errorRaw = null;
@@ -720,13 +726,19 @@ export class PoolSupervisor {
     kind: string,
     raw: string | null,
     now: number,
+    transient: boolean,
   ): void {
     const lane = this.lanes.find((entry) => entry.name === unit.lane);
     if (lane && lane.effectiveCap > 1) {
       lane.effectiveCap -= 1;
       lane.sqliteShrink += 1;
     }
-    this.consecutiveSqlite += 1;
+    // Transient errors pause and halve the admission ramp, and never count toward the stop.
+    if (transient) {
+      this.admission.noteTransient(now);
+    } else {
+      this.consecutiveSqlite += 1;
+    }
     this.sqliteSuccesses = 0;
     fs.rmSync(unitPaths(this.config.poolDir, unit.key).exit, { force: true });
     unit.exitCode = exitCode;
@@ -746,7 +758,7 @@ export class PoolSupervisor {
       unit.notBefore = now + SQLITE_BACKOFF_MS * unit.sqliteRetries;
     }
     this.save(unit);
-    if (this.consecutiveSqlite >= SQLITE_CONSECUTIVE_STOP) {
+    if (!transient && this.consecutiveSqlite >= SQLITE_CONSECUTIVE_STOP) {
       this.stop(
         "limit-stopped",
         `${SQLITE_CONSECUTIVE_STOP} consecutive sqlite failures (${kind})`,
@@ -831,6 +843,9 @@ export class PoolSupervisor {
       if (!canStart(new Set(unit.names), this.runningUnits(), this.hubs, this.config.perFileCap)) {
         continue;
       }
+      const cap = this.lanes.reduce((sum, entry) => sum + entry.cap, 0);
+      if (this.admission.admitAt(now, this.running().length, cap) !== null) return;
+      this.admission.launched(now);
       this.launch(unit, lane, now);
     }
   }

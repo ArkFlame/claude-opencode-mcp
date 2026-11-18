@@ -8,6 +8,14 @@ import { type AttemptResult, KILL_GRACE_MS, runAttempt } from "./attempt.js";
 import { runErrorKind } from "./errors.js";
 import { foreignCwdHolder } from "./lock.js";
 import { createRunOwner, type OwnerScope, ownershipOf, type RunOwner } from "./owner.js";
+import {
+  isTransientError,
+  RampGate,
+  rampConfigFromEnv,
+  sleepUnlessAborted,
+  TRANSIENT_MAX_RETRIES,
+  transientBackoffMs,
+} from "./ramp.js";
 import type { RunSettings } from "./settings.js";
 import {
   isProcessAlive,
@@ -135,10 +143,14 @@ export class RunManager {
   readonly owner: RunOwner;
   private reaper: NodeJS.Timeout | null = null;
   private stopping = false;
+  private readonly ramp: RampGate;
+  private wakeTimer: NodeJS.Timeout | null = null;
+  private wakeTarget = Number.POSITIVE_INFINITY;
 
   constructor(private readonly options: RunManagerOptions) {
     this.owner = options.owner ?? createRunOwner({ env: process.env });
     this.ownerPid = options.ownerPid ?? this.owner.pid;
+    this.ramp = new RampGate(rampConfigFromEnv(process.env));
     this.events.setMaxListeners(200);
   }
 
@@ -244,14 +256,37 @@ export class RunManager {
 
   private pump(): void {
     const foreign = this.foreignRuns();
-    while (this.active.size < this.options.settings.maxParallel) {
+    const max = this.options.settings.maxParallel;
+    while (this.active.size < max) {
       const index = this.queue.findIndex((job) => this.canStart(job, foreign));
       if (index < 0) return;
+      const now = Date.now();
+      const wait = this.ramp.admitAt(now, this.active.size, max);
+      if (wait !== null) {
+        if (Number.isFinite(wait)) this.wakeAt(wait);
+        return;
+      }
       const [job] = this.queue.splice(index, 1);
       if (!job) return;
+      this.ramp.launched(now);
       this.active.set(job.record.id, job);
       void this.execute(job);
     }
+  }
+  /** Re-run the pump at `at` (ramp step, launch gap or transient pause end), earliest wins. */
+  private wakeAt(at: number): void {
+    if (this.wakeTimer && this.wakeTarget <= at) return;
+    if (this.wakeTimer) clearTimeout(this.wakeTimer);
+    this.wakeTarget = at;
+    this.wakeTimer = setTimeout(
+      () => {
+        this.wakeTimer = null;
+        this.wakeTarget = Number.POSITIVE_INFINITY;
+        this.pump();
+      },
+      Math.max(0, at - Date.now()),
+    );
+    this.wakeTimer.unref();
   }
 
   private persist(record: RunRecord): void {
@@ -270,7 +305,8 @@ export class RunManager {
     const maxAttempts = this.options.settings.retry ? 2 : 1;
     let result: AttemptResult | null = null;
     try {
-      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      let transientRetries = 0;
+      for (let attempt = 1; ; attempt += 1) {
         record.attempts = attempt;
         record.status = "running";
         record.started = Date.now();
@@ -316,7 +352,26 @@ export class RunManager {
           },
           job.abort.signal,
         );
-        if (job.abort.signal.aborted || result.end !== "exit" || result.text) break;
+        if (job.abort.signal.aborted) break;
+        if (isTransientError(result.errorMessage)) {
+          this.ramp.noteTransient(Date.now());
+          if (transientRetries < TRANSIENT_MAX_RETRIES) {
+            transientRetries += 1;
+            const delay = transientBackoffMs(transientRetries);
+            this.options.logger.warn("transient opencode error; retrying", {
+              run_id: record.id,
+              attempt,
+              retry: transientRetries,
+              delay_ms: delay,
+            });
+            await sleepUnlessAborted(delay, job.abort.signal);
+            if (job.abort.signal.aborted) break;
+            continue;
+          }
+        }
+        if (result.end !== "exit" || result.text || attempt - transientRetries >= maxAttempts) {
+          break;
+        }
         this.options.logger.warn("run ended without a final reply", {
           run_id: record.id,
           attempt,
@@ -375,6 +430,7 @@ export class RunManager {
       error: record.error,
     });
     this.persist(record);
+    if (!isTransientError(record.error_raw)) this.ramp.noteOk();
     this.active.delete(record.id);
     this.options.logger.info("run finished", {
       run_id: record.id,
@@ -610,6 +666,8 @@ export class RunManager {
   async shutdown(): Promise<void> {
     this.stopping = true;
     if (this.reaper) clearInterval(this.reaper);
+    if (this.wakeTimer) clearTimeout(this.wakeTimer);
+    this.wakeTimer = null;
     for (const job of this.queue.splice(0)) this.abort(job.record.id);
     for (const id of this.active.keys()) this.abort(id);
   }

@@ -584,6 +584,10 @@ Environment variables (env overrides `config.json` values in the `runs` section)
 | `CLAUDE_OPENCODE_IDLE_TIMEOUT` | `300` | Older name for the idle limit, read when `CLAUDE_OPENCODE_IDLE_SECONDS` is unset |
 | `CLAUDE_OPENCODE_MAX_PARALLEL` | `10` | Slots for concurrent runs. `delegate_task` and `list_runs` report `slots.source` as `env:CLAUDE_OPENCODE_MAX_PARALLEL`, `default` or `config` |
 | `CLAUDE_OPENCODE_MIN_FREE_MB` | `1024` | Free-space floor. Below it, new runs are refused with `disk_low` and a live pool pauses new launches |
+| `CLAUDE_OPENCODE_RAMP_INITIAL` | `8` | Launches admitted at a cold start (no run active). Applies to `delegate_task` queue admission and `run_pool` alike |
+| `CLAUDE_OPENCODE_RAMP_STEP` | `6` | Extra launches admitted each `CLAUDE_OPENCODE_RAMP_INTERVAL_MS` until the parallel cap. After the cap is reached, freed slots refill at once |
+| `CLAUDE_OPENCODE_RAMP_INTERVAL_MS` | `20000` | Time between ramp steps. `0` disables the ramp |
+| `CLAUDE_OPENCODE_LAUNCH_GAP_MS` | `300` | Minimum spacing between launches while the ramp is below its cap |
 | `CLAUDE_OPENCODE_MAX_PARALLEL` | `10` | Concurrent runs; extra runs queue FIFO |
 | `CLAUDE_OPENCODE_ALLOWED_ROOTS` | parent of the repo | Path-delimiter-separated roots runs may use |
 | `CLAUDE_OPENCODE_BRIEF_HEADER` | built-in header | File whose text prepends every brief |

@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- Automatic staggered ramp for launches: a cold start admits `CLAUDE_OPENCODE_RAMP_INITIAL` (8) runs, then `CLAUDE_OPENCODE_RAMP_STEP` (6) more every `CLAUDE_OPENCODE_RAMP_INTERVAL_MS` (20000, `0` disables), spaced by `CLAUDE_OPENCODE_LAUNCH_GAP_MS` (300). Applies to `delegate_task` and `run_pool`.
+- Transient opencode errors (`Failed to execute statement`, `UnexpectedStatus: 5xx`, `ECONNRESET`, `database is locked`, `SQLITE`) retry a run up to 3 times with 2s, 5s, 10s jittered backoff. They do not count toward the pool's consecutive-failure stop; three in a row pause admission for 30s and halve the ramp step.
 ### Changed
 - Server instructions now tell the orchestrator how to listen for results: block on `wait_any` or `wait_pool`, never poll with a shell loop.
 
