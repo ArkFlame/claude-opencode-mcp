@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-17
+### Added
+- Shared-checkout runs: `delegate_task` accepts `shared` and `forbid`. The worker runs in `cwd`, is told not to run the forbidden commands, and does not commit.
+- `run_pool`: a detached supervisor runs one worker per open unit file with lanes and caps. It adopts live workers on restart, serializes units that share an exclusive `.rs` name, caps generic and hub names with `per_file_cap`, requeues provider-limit hits with lane backoff, and stops after six consecutive hits.
+- `pool_status`: per-lane progress, provider hits, stale workers and an ETA.
+- `auto_commit`: a background loop that commits pending changes per area and pushes the branch.
+- `usage_stats`: read-only per-model statistics from the opencode database.
+- Pool workers appear in `list_runs`. `abort_all` stops pools and `abort_run` stops a single unit.
+- `docs/POOL.md` describes pool mode and its limits.
+
 ## [1.2.0] - 2026-11-17
 ### Added
 - Background CLI runs. `delegate_task` returns a `run_id` immediately, with a hard timeout (`CLAUDE_OPENCODE_TIMEOUT`), an idle watchdog (`CLAUDE_OPENCODE_IDLE_TIMEOUT`), and SIGTERM then SIGKILL on the whole process group.

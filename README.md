@@ -563,3 +563,15 @@ Environment variables (env overrides `config.json` values in the `runs` section)
 | `CLAUDE_OPENCODE_BIN` | `opencode` | OpenCode executable |
 
 Install as a Claude Code server with `scripts/install.sh`. See `docs/installation.md`.
+
+## Pool mode (v1.3.0)
+
+For large backlogs of small edits in one shared checkout, see [docs/POOL.md](docs/POOL.md).
+
+| Tool | Purpose |
+| --- | --- |
+| `delegate_task` (`shared: true`, `forbid`) | Run in `cwd` with no worktree; the worker must not run the forbidden commands or commit |
+| `run_pool` | Detached supervisor over `units_glob`: lanes with caps, conflict control, limit backoff, hard timeouts |
+| `pool_status` | Per-lane progress, provider hits, stale workers, ETA (read-only) |
+| `auto_commit` | Start, stop or inspect a loop that commits per area and pushes the branch |
+| `usage_stats` | Per-model tokens, reasoning share, TTFT and tokens/s from the opencode database (read-only) |
