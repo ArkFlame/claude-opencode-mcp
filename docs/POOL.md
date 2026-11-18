@@ -137,3 +137,43 @@ Shared workers share one checkout, so the rules are strict. Each worker:
 - ends its reply with `Status: PASS|UNVERIFIED|BLOCKED|FAILED`
 
 The orchestrator runs builds and tests after the batch. `auto_commit` (or the orchestrator) commits.
+
+## Queued messages
+
+`queue_message` sends a follow-up to a pool unit or an OpenCode session. Messages live in
+`<runs dir>/<run id>.inbox.jsonl`, one JSON object per line, rewritten atomically (temp file, then
+rename). Each message has an `id` (`msg_` + 12 hex), `ts`, `mode`, `status` (`queued`, `delivered`,
+`cancelled`, `failed`), `priority`, `attempts`, `last_error` and `next_attempt_at`.
+
+- `mode: "when_idle"` (default) waits for the unit to finish its current attempt.
+- `mode: "now"` interrupts a running unit: the supervisor sends SIGTERM to the process group,
+  waits for the exit, and redelivers the message on the same session. The interrupted attempt is
+  not counted against the message. A "now" message to an `aborted` run resurrects it; a
+  `when_idle` message to an aborted run is refused.
+- Order: higher `priority` first, then "now" before "when_idle", then arrival.
+
+Delivery to pool units:
+
+- A queued message wakes a finished or failed unit. The supervisor launches
+  `opencode run --session <session id> --auto -m <lane model> --format json -- <message>` with
+  the message as one argv entry, never through a shell.
+- The session id comes from the newest OpenCode session titled `pool <unit>` (or `pool:<unit>`),
+  read through `node:sqlite` or the `sqlite3 -readonly` CLI.
+- Redeliveries are scheduled like any unit: they use the lane caps and backoff, and they run
+  before fresh units.
+- `queue_message` starts a supervisor with `--redeliver-only` when the pool is not running. That
+  mode launches only units that have a due message, so a stopped pool's other units are not
+  rerun.
+- A limit hit refunds the attempt and requeues the message. Three failed attempts mark it `failed`.
+- A unit without a session (its brief has not started yet) keeps the message queued until a
+  session exists. A finished unit with no session fails its messages.
+
+Delivery to OpenCode sessions (`create_session` and `delegate_task` sessions) uses OpenCode's
+async prompt call. OpenCode appends the message to the session queue when the session is busy and
+starts it when idle. "now" first calls `session.abort`. A refused send retries after 5 s × attempt
+count, from a timer in the MCP server process.
+
+Limits: background CLI runs that are not pool units are not supported and are refused. Delivery
+between two processes that write the same inbox is last-writer-wins for the rewrite window, so
+keep one MCP server per runs directory. Messages are untrusted instructions; `list_messages`
+shows only a 200-character preview.

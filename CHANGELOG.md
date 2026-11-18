@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-11-17
+### Added
+- `queue_message`: queue a follow-up for a pool unit or an OpenCode session. `when_idle` waits for the current attempt; `now` interrupts a running pool unit and redelivers on the same session. Messages are stored per run in an atomic JSON-lines inbox with a priority order, three delivery attempts and a cancel path.
+- `list_messages` and `cancel_message` inspect and cancel queued messages.
+- Pool supervisors deliver queued messages through the normal lane caps and backoff, ahead of fresh units. `queue_message` restarts a finished pool in redeliver-only mode, so other units are not rerun.
+- `list_runs` and `get_run` report `queued_messages`.
+
 ## [1.3.0] - 2026-11-17
 ### Added
 - Shared-checkout runs: `delegate_task` accepts `shared` and `forbid`. The worker runs in `cwd`, is told not to run the forbidden commands, and does not commit.

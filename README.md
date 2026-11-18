@@ -542,8 +542,8 @@ across MCP restarts, and orphaned runs are reaped at startup.
 | Tool | Purpose |
 | --- | --- |
 | `delegate_task` | Start a run: `task`, `brief`, `cwd`, `model`, `agent`, `read_paths`, `allow_edits`, `allow_bash`, `allow_shared_cwd`, `wait_seconds` (<= 110) |
-| `list_runs` | Status, age, idle seconds, cwd, branch, last log line, one-line summary |
-| `get_run` | Final reply (16 KB cap), parsed `Status:`/commit/tests, log tail, git diff stat |
+| `list_runs` | Status, age, idle seconds, cwd, branch, last log line, queued message count, one-line summary |
+| `get_run` | Final reply (16 KB cap), parsed `Status:`/commit/tests, log tail, git diff stat, queued message count |
 | `wait_any` | Block up to N seconds (<= 110) until any listed run finishes |
 | `abort_run` / `abort_all` | Stop one run or all runs, then reap stale records |
 | `list_models` | Models from `opencode models`, cached five minutes |
@@ -563,6 +563,16 @@ Environment variables (env overrides `config.json` values in the `runs` section)
 | `CLAUDE_OPENCODE_BIN` | `opencode` | OpenCode executable |
 
 Install as a Claude Code server with `scripts/install.sh`. See `docs/installation.md`.
+
+## Queued messages (v1.4.0)
+
+Send a follow-up to a running or finished agent without waiting for it to end. Details: [docs/POOL.md](docs/POOL.md#queued-messages).
+
+| Tool | Purpose |
+| --- | --- |
+| `queue_message` | Queue `message` (1 to 20000 chars) for a run id. `mode` is `when_idle` (default) or `now`; `priority` orders delivery |
+| `list_messages` | Inbox rows for one run or all runs: status, attempts, last error, preview |
+| `cancel_message` | Cancel a queued message that has not started delivery |
 
 ## Pool mode (v1.3.0)
 
