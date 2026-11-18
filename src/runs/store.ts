@@ -50,6 +50,8 @@ export interface RunRecord {
   error: string | null;
   prompt_file: string;
   log_file: string;
+  /** Pool id when the run is a unit worker of pool mode (owned by its supervisor). */
+  pool?: string | null;
 }
 
 /** Persists one JSON file per run under the runs directory. Writes are atomic (tmp + rename). */

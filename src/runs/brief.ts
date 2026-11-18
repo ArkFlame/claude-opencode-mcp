@@ -17,6 +17,51 @@ export const DEFAULT_BRIEF_HEADER = [
   "- If blocked, stop and report the blocker in the final reply.",
 ].join("\n");
 
+/** Commands shared-checkout workers must not run unless they are told otherwise. */
+export const DEFAULT_FORBIDDEN_COMMANDS = ["git", "cargo"];
+const MAX_FORBID_ENTRIES = 20;
+const FORBID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/;
+
+export const SHARED_BRIEF_HEADER = [
+  "# Worker contract (shared checkout)",
+  "",
+  "You edit a checkout that other workers edit at the same time. Follow these rules:",
+  "- Touch only the files your task needs. Do not reformat or rename files you do not own.",
+  "- Do not switch branches, stash, reset, rebase, or commit. The orchestrator commits.",
+  "- Your final reply must end with `Status: PASS|UNVERIFIED|BLOCKED|FAILED` on its own line.",
+  "- If blocked, stop and report the blocker in the final reply.",
+].join("\n");
+
+export function validateForbid(list: string[] | undefined): string[] {
+  const forbid = list ?? DEFAULT_FORBIDDEN_COMMANDS;
+  if (forbid.length > MAX_FORBID_ENTRIES) {
+    throw new BridgeError(
+      "INVALID_ARGUMENT",
+      `forbid accepts at most ${MAX_FORBID_ENTRIES} entries.`,
+    );
+  }
+  for (const entry of forbid) {
+    if (!FORBID_PATTERN.test(entry)) {
+      throw new BridgeError(
+        "INVALID_ARGUMENT",
+        `forbid entries must be plain command names: ${entry}`,
+      );
+    }
+  }
+  return [...new Set(forbid)];
+}
+
+/** Prompt section for shared-checkout runs: the command ban list and the no-git rule. */
+export function sharedSection(forbid: string[]): string {
+  const list = forbid.length > 0 ? forbid.map((cmd) => `\`${cmd}\``).join(", ") : "none";
+  return [
+    "# Shared checkout",
+    "",
+    `Do not run these commands: ${list}. Do not run any command that starts with them.`,
+    "The orchestrator runs builds, tests and commits after the batch lands.",
+  ].join("\n");
+}
+
 export function loadBriefHeader(file: string | null): string {
   if (!file) return DEFAULT_BRIEF_HEADER;
   try {
@@ -57,11 +102,13 @@ export function buildPrompt(input: {
   task: string;
   brief: string | null;
   readPaths: string[];
+  shared?: { forbid: string[] } | null;
 }): string {
   const sections: string[] = [];
   if (input.header) sections.push(input.header.trim());
   sections.push(`# Task\n\n${input.task.trim()}`);
   if (input.brief?.trim()) sections.push(`# Brief\n\n${input.brief.trim()}`);
+  if (input.shared) sections.push(sharedSection(input.shared.forbid));
   if (input.readPaths.length > 0) {
     const list = input.readPaths.map((entry) => `- ${entry}`).join("\n");
     sections.push(

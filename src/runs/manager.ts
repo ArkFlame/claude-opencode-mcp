@@ -356,6 +356,16 @@ export class RunManager {
     const hardLimit = this.options.settings.timeoutMs + REAP_MARGIN_MS;
     for (const record of this.store.list()) {
       if (isTerminal(record.status) || this.active.has(record.id)) continue;
+      if (record.pool) {
+        // Pool workers belong to their supervisor. Reap only when neither it nor the worker lives.
+        const pgid = record.pgid ?? record.pid;
+        const orphaned = !isProcessAlive(record.owner_pid) && (!pgid || !isProcessAlive(pgid));
+        if (orphaned) {
+          this.reapRecord(record, "pool supervisor exited; worker gone", "stale");
+          count += 1;
+        }
+        continue;
+      }
       const ownerGone = record.owner_pid === this.ownerPid || !isProcessAlive(record.owner_pid);
       const overdue = record.started !== null && now - record.started > hardLimit;
       if (!ownerGone && !overdue && record.status !== "queued") continue;
