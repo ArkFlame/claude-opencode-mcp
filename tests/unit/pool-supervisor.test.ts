@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { eventsFileForPool, readEventsFrom } from "../../src/events/log.js";
 import { KILL_GRACE_MS } from "../../src/pool/core.js";
 import {
   type PoolConfig,
@@ -515,18 +516,106 @@ describe("unit rescan and controls", () => {
   });
 });
 
-describe("pool idle kill", () => {
-  it("kills a worker whose log has been silent past the idle limit", () => {
-    const { ops, supervisor, config } = boot({ "a.md": OPEN });
-    ops.clock = Date.now();
-    supervisor.tick();
-    const log = unitPaths(config.poolDir, "a").log;
+describe("pool events and controls", () => {
+  function silence(ops: FakeOps, config: PoolConfig, key: string): void {
+    const log = unitPaths(config.poolDir, key).log;
     fs.writeFileSync(log, "");
     const old = (ops.clock - 400_000) / 1000;
     fs.utimesSync(log, old, old);
     ops.clock += 1_000;
+  }
+
+  function eventTypes(config: PoolConfig): string[] {
+    return readEventsFrom(eventsFileForPool(config.poolDir), 0).events.map((e) => e.type);
+  }
+
+  it("emits start, finish and pool_done to the pool event log", () => {
+    const { ops, supervisor, config } = boot({ "a.md": OPEN });
+    supervisor.tick();
+    ops.end("a", 0);
+    supervisor.tick();
+    expect(eventTypes(config)).toEqual(
+      expect.arrayContaining(["unit_started", "unit_done", "pool_done"]),
+    );
+  });
+
+  it("reports a silent worker as stale and keeps it running by default", () => {
+    const { ops, supervisor, config } = boot({ "a.md": OPEN });
+    supervisor.tick();
+    silence(ops, config, "a");
+    supervisor.tick();
+    supervisor.tick();
+    expect(supervisor.unit("a")?.state).toBe("running");
+    expect(eventTypes(config).filter((type) => type === "stale")).toHaveLength(1);
+  });
+
+  it("aborts a silent worker with stale_action abort_requeue", () => {
+    const { ops, supervisor, config } = boot({ "a.md": OPEN }, { staleAction: "abort_requeue" });
+    supervisor.tick();
+    silence(ops, config, "a");
     supervisor.tick();
     expect(supervisor.unit("a")?.state).toBe("killing");
     expect(supervisor.unit("a")?.error).toBe("idle");
+  });
+
+  it("requeues every silent worker when requeue_stale is requested", () => {
+    const { ops, supervisor, config } = boot({ "a.md": OPEN });
+    supervisor.tick();
+    silence(ops, config, "a");
+    writeControl(config.poolDir, { add_units: [], retry_failed: false, requeue_stale: true });
+    supervisor.tick();
+    expect(supervisor.unit("a")?.state).toBe("killing");
+    expect(readControl(config.poolDir).requeue_stale).toBe(false);
+  });
+
+  it("applies a lane cap written by set_pool_cap on the next tick", () => {
+    const { ops, supervisor, config } = boot({ "a.md": OPEN, "b.md": OPEN, "c.md": OPEN });
+    supervisor.tick();
+    expect(ops.spawns.map((entry) => entry.key)).toEqual(["a", "b"]);
+    const lane = config.lanes[0]?.name ?? "";
+    writeControl(config.poolDir, { add_units: [], retry_failed: false, lane_caps: { [lane]: 1 } });
+    ops.end("a", 0);
+    supervisor.tick();
+    expect(ops.spawns.map((entry) => entry.key)).toEqual(["a", "b"]);
+    const change = readEventsFrom(eventsFileForPool(config.poolDir), 0).events.find(
+      (e) => e.type === "lane_cap_changed",
+    );
+    expect(change).toMatchObject({ lane, to: 1, reason: "operator" });
+  });
+
+  it("ramps lane caps up from start by step each interval", () => {
+    const { ops, supervisor, config } = boot(
+      { "a.md": OPEN, "b.md": OPEN, "c.md": OPEN },
+      { ramp: { start: 1, step: 1, max: 2, everySeconds: 30, backoffOnFailures: 2 } },
+    );
+    supervisor.tick();
+    expect(ops.spawns.map((entry) => entry.key)).toEqual(["a"]);
+    ops.clock += 30_000;
+    supervisor.tick();
+    expect(ops.spawns.map((entry) => entry.key)).toEqual(["a", "b"]);
+    const changes = readEventsFrom(eventsFileForPool(config.poolDir), 0).events.filter(
+      (e) => e.type === "lane_cap_changed",
+    );
+    expect(changes).toHaveLength(1);
+    expect(changes[0]).toMatchObject({ from: 1, to: 2, reason: "ramp" });
+  });
+
+  it("cuts the ramp back by one step on a failure spike", () => {
+    const { ops, supervisor, config } = boot(
+      { "a.md": OPEN, "b.md": OPEN, "c.md": OPEN },
+      { ramp: { start: 1, step: 1, max: 2, everySeconds: 30, backoffOnFailures: 1 } },
+    );
+    supervisor.tick();
+    ops.clock += 30_000;
+    supervisor.tick();
+    ops.end("a", 3);
+    ops.clock += 1_000;
+    supervisor.tick();
+    ops.clock += 29_000;
+    supervisor.tick();
+    const changes = readEventsFrom(eventsFileForPool(config.poolDir), 0).events.filter(
+      (e) => e.type === "lane_cap_changed",
+    );
+    expect(changes.at(-1)).toMatchObject({ from: 2, to: 1, reason: "failure spike" });
   });
 });

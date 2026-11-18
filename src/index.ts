@@ -4,6 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { Command } from "commander";
 import { runInit } from "./cli/init.js";
 import { loadConfig } from "./config/config.js";
+import { runEventsCommand } from "./events/follow.js";
 import { createMcpServer, SERVER_VERSION } from "./mcp/server.js";
 import { OpenCodeManager } from "./opencode/manager.js";
 import { SessionRegistry } from "./opencode/sessions.js";
@@ -132,6 +133,29 @@ async function main(): Promise<void> {
         ...(options.writeMcp ? { writeMcp: true } : {}),
       });
       process.exitCode = code;
+    });
+
+  program
+    .command("events")
+    .description(
+      "follow one pool (--pool) or run (--run): one line per event, a heartbeat each minute, exits when it finishes",
+    )
+    .option("--pool <id>", "pool id to follow")
+    .option("--run <id>", "run id to follow")
+    .option("--runs-dir <dir>", "runs directory (default: the configured runs directory)")
+    .action(async (options: { pool?: string; run?: string; runsDir?: string }) => {
+      const env = process.env;
+      const runsDir =
+        options.runsDir ?? resolveRunSettings((await loadConfig({ env })).config, env).runsDir;
+      const controller = new AbortController();
+      process.once("SIGINT", () => controller.abort());
+      process.once("SIGTERM", () => controller.abort());
+      process.exitCode = await runEventsCommand({
+        ...(options.pool ? { pool: options.pool } : {}),
+        ...(options.run ? { run: options.run } : {}),
+        runsDir,
+        signal: controller.signal,
+      });
     });
 
   program

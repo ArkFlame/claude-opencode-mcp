@@ -20,6 +20,16 @@ export interface PoolConfig {
   timeoutMs: number;
   /** Idle limit before a silent worker is stale or killed. Default 300 s (absent on older pools). */
   idleMs?: number;
+  /** Ramp lane caps up from `start` while failures stay low. Absent: lanes run at their cap. */
+  ramp?: {
+    start: number;
+    step: number;
+    max: number;
+    everySeconds: number;
+    backoffOnFailures: number;
+  };
+  /** What a silent worker does: report it as stale (default), or abort it and requeue the unit. */
+  staleAction?: "report" | "abort_requeue";
   forbid: string[];
   /** Attempts after a sqlite failure before the unit fails. Default 2 (absent on older pools). */
   maxRetries?: number;
@@ -43,6 +53,8 @@ export interface UnitRecord {
   attempts: number;
   timeouts: number;
   limitHits: number;
+  /** Idle aborts so far; a unit past max_retries fails instead of requeueing. */
+  idleRetries?: number;
   pid: number | null;
   pgid: number | null;
   started: number | null;
@@ -132,6 +144,10 @@ export function unitPaths(poolDir: string, key: string): UnitPaths {
 export interface PoolControl {
   add_units: string[];
   retry_failed: boolean;
+  /** Operator lane caps to apply on the next tick (set_pool_cap). */
+  lane_caps?: Record<string, number>;
+  /** Abort and requeue every silent worker on the next tick. */
+  requeue_stale?: boolean;
 }
 
 export function readControl(poolDir: string): PoolControl {
@@ -141,6 +157,12 @@ export function readControl(poolDir: string): PoolControl {
       ? value.add_units.filter((entry): entry is string => typeof entry === "string")
       : [],
     retry_failed: value?.retry_failed === true,
+    lane_caps: Object.fromEntries(
+      Object.entries(value?.lane_caps ?? {}).filter(
+        (entry): entry is [string, number] => Number.isInteger(entry[1]) && entry[1] >= 0,
+      ),
+    ),
+    requeue_stale: value?.requeue_stale === true,
   };
 }
 

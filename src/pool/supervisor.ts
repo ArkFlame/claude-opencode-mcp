@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { appendEvent, eventsFileForPool } from "../events/log.js";
 import {
   inboxFileFor,
   mutateMessage,
@@ -100,6 +101,9 @@ export interface SupervisorOptions {
  * and writes per-unit state so a restarted supervisor can adopt live workers. It also delivers
  * queued messages: a message wakes its unit, and a "now" message interrupts a running one.
  */
+/** After a failure spike the ramp stops raising lane caps for this long. */
+const RAMP_PAUSE_MS = 600_000;
+
 export class PoolSupervisor {
   private readonly units = new Map<string, UnitRecord>();
   private readonly unitNames = new Map<string, Set<string>>();
@@ -113,6 +117,12 @@ export class PoolSupervisor {
   private sqliteSuccesses = 0;
   private pausedReason: string | null = null;
   private lastScan = Number.NEGATIVE_INFINITY;
+  private readonly seenStates = new Map<string, UnitRecord["state"]>();
+  private readonly staleKeys = new Set<string>();
+  /** Times an attempt ended in failure or requeue, for the ramp's failure window. */
+  private readonly failureTimes: number[] = [];
+  private lastRamp = Number.NEGATIVE_INFINITY;
+  private rampPauseUntil = Number.NEGATIVE_INFINITY;
   /** Unit files seen without an open marker, with the mtime they had when checked. */
   private readonly closedAt = new Map<string, number>();
 
@@ -127,7 +137,7 @@ export class PoolSupervisor {
       name: lane.name,
       model: lane.model,
       cap: lane.cap,
-      effectiveCap: lane.cap,
+      effectiveCap: config.ramp ? Math.min(lane.cap, config.ramp.start) : lane.cap,
       hits: 0,
       backoffUntil: 0,
       sqliteShrink: 0,
@@ -181,9 +191,26 @@ export class PoolSupervisor {
    */
   private refresh(now: number): void {
     const control = readControl(this.config.poolDir);
-    if (control.retry_failed) {
-      this.retryFailed();
-      writeControl(this.config.poolDir, { ...control, retry_failed: false });
+    if (control.retry_failed) this.retryFailed();
+    for (const [lane, cap] of Object.entries(control.lane_caps ?? {})) {
+      this.setOperatorCap(lane, cap);
+    }
+    if (control.requeue_stale) {
+      for (const unit of this.units.values()) {
+        if (this.isSilent(unit, now)) this.abortIdle(unit, now);
+      }
+    }
+    if (
+      control.retry_failed ||
+      control.requeue_stale ||
+      Object.keys(control.lane_caps ?? {}).length > 0
+    ) {
+      writeControl(this.config.poolDir, {
+        ...control,
+        retry_failed: false,
+        requeue_stale: false,
+        lane_caps: {},
+      });
     }
     // A message-only restart never adopts new units.
     if (this.options.redeliverOnly || now - this.lastScan < UNIT_SCAN_MS) return;
@@ -331,6 +358,7 @@ export class PoolSupervisor {
       return false;
     }
     this.refresh(now);
+    this.ramp(now);
     this.syncMessages(now);
     for (const unit of [...this.units.values()]) this.monitor(unit, now);
     if (this.status !== "running") return false;
@@ -340,6 +368,7 @@ export class PoolSupervisor {
     this.persist();
     if (open.length === 0) {
       this.status = "done";
+      this.emit("pool_done", this.totals());
       this.persist();
       return false;
     }
@@ -485,15 +514,108 @@ export class PoolSupervisor {
       this.beginKill(unit, now);
       return;
     }
-    // Silent past the idle limit, and the log has not moved for IDLE_CONFIRM_MS: kill it.
+    this.checkSilence(unit, now);
+  }
+
+  private emit(type: string, data: Record<string, unknown> = {}): void {
+    appendEvent(eventsFileForPool(this.config.poolDir), type, data);
+  }
+
+  private totals(): { total: number; done: number; failed: number } {
+    const units = [...this.units.values()];
+    return {
+      total: units.length,
+      done: units.filter((unit) => unit.state === "done").length,
+      failed: units.filter((unit) => unit.state === "failed").length,
+    };
+  }
+
+  /** Emit the event for a unit's state change, and record attempts that ended in failure. */
+  private noteTransition(unit: UnitRecord): void {
+    const previous = this.seenStates.get(unit.key);
+    this.seenStates.set(unit.key, unit.state);
+    if (previous === undefined || previous === unit.state) return;
+    const attemptEnded = previous === "running" || previous === "killing";
+    if (attemptEnded && (unit.state === "failed" || unit.state === "queued")) {
+      this.failureTimes.push(this.ops.now());
+      if (this.failureTimes.length > 1_000) this.failureTimes.splice(0, 500);
+    }
+    if (unit.state === "running") {
+      this.emit("unit_started", { key: unit.key, lane: unit.lane });
+    } else if (unit.state === "done") {
+      this.emit("unit_done", { key: unit.key });
+    } else if (unit.state === "failed") {
+      this.emit("unit_failed", { key: unit.key, error: unit.error, error_kind: unit.errorKind });
+    } else if (unit.state === "queued" && previous !== "queued") {
+      this.emit("unit_requeued", { key: unit.key, reason: unit.error });
+    }
+  }
+
+  /** A running worker whose log has been silent past the idle limit (and IDLE_CONFIRM_MS). */
+  private isSilent(unit: UnitRecord, now: number): boolean {
     const silentMs = now - this.logMtime(unit.key, now);
-    if (
+    return (
       unit.state === "running" &&
       silentMs > (this.config.idleMs ?? STALE_LOG_MS) &&
       silentMs >= IDLE_CONFIRM_MS
-    ) {
-      unit.error = "idle";
-      this.beginKill(unit, now);
+    );
+  }
+
+  /** Report a silent worker once as stale; with abort_requeue, abort it so the unit requeues. */
+  private checkSilence(unit: UnitRecord, now: number): void {
+    if (!this.isSilent(unit, now)) {
+      this.staleKeys.delete(unit.key);
+      return;
+    }
+    if (!this.staleKeys.has(unit.key)) {
+      this.staleKeys.add(unit.key);
+      const idleSeconds = Math.round((now - this.logMtime(unit.key, now)) / 1000);
+      this.emit("stale", { key: unit.key, idle_seconds: idleSeconds });
+    }
+    if (this.config.staleAction === "abort_requeue") this.abortIdle(unit, now);
+  }
+
+  /** Kill a silent worker; afterKill requeues it while idle retries remain. */
+  private abortIdle(unit: UnitRecord, now: number): void {
+    unit.error = "idle";
+    this.beginKill(unit, now);
+  }
+
+  private changeCap(lane: LaneState, next: number, reason: string): void {
+    if (lane.effectiveCap === next) return;
+    const from = lane.effectiveCap;
+    lane.effectiveCap = next;
+    this.emit("lane_cap_changed", { lane: lane.name, from, to: next, reason });
+  }
+
+  /** Operator cap from set_pool_cap: the configured cap and the live cap both become `cap`. */
+  private setOperatorCap(name: string, cap: number): void {
+    const lane = this.lanes.find((entry) => entry.name === name);
+    if (!lane) return;
+    lane.cap = cap;
+    this.changeCap(lane, cap, "operator");
+  }
+
+  /** Ramp: every interval, raise lane caps by `step` while recent failures stay under the threshold. */
+  private ramp(now: number): void {
+    const ramp = this.config.ramp;
+    const everyMs = ramp ? ramp.everySeconds * 1000 : 0;
+    if (!ramp) return;
+    if (this.lastRamp === Number.NEGATIVE_INFINITY) {
+      this.lastRamp = now;
+      return;
+    }
+    if (now - this.lastRamp < everyMs) return;
+    this.lastRamp = now;
+    if (now < this.rampPauseUntil) return;
+    const recent = this.failureTimes.filter((at) => now - at < everyMs).length;
+    for (const lane of this.lanes) {
+      if (recent >= ramp.backoffOnFailures) {
+        this.rampPauseUntil = now + RAMP_PAUSE_MS;
+        this.changeCap(lane, Math.max(1, lane.effectiveCap - ramp.step), "failure spike");
+      } else {
+        this.changeCap(lane, Math.min(lane.cap, ramp.max, lane.effectiveCap + ramp.step), "ramp");
+      }
     }
   }
 
@@ -530,6 +652,15 @@ export class PoolSupervisor {
       unit.state = "failed";
       unit.finished = this.ops.now();
       unit.errorKind = "timeout";
+    } else if (unit.error === "idle") {
+      unit.idleRetries = (unit.idleRetries ?? 0) + 1;
+      if (unit.idleRetries > (this.config.maxRetries ?? DEFAULT_MAX_RETRIES)) {
+        unit.state = "failed";
+        unit.finished = this.ops.now();
+        unit.errorKind = "idle";
+      } else {
+        unit.state = "queued";
+      }
     } else {
       unit.state = "queued";
     }
@@ -767,6 +898,7 @@ export class PoolSupervisor {
 
   private stop(status: "stopped" | "limit-stopped", reason: string, now: number): void {
     this.status = status;
+    this.emit("pool_stopped", { status, reason });
     this.reason = reason;
     for (const unit of this.running()) {
       if (unit.pgid !== null) this.ops.signal(unit.pgid, "SIGTERM");
@@ -809,6 +941,11 @@ export class PoolSupervisor {
   }
 
   private save(unit: UnitRecord): void {
+    this.writeRecord(unit);
+    this.noteTransition(unit);
+  }
+
+  private writeRecord(unit: UnitRecord): void {
     const now = this.ops.now();
     writeUnit(this.config.poolDir, unit);
     try {

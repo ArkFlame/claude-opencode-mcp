@@ -3,6 +3,7 @@ import path from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { BridgeError } from "../../errors.js";
+import { monitorCommandFor } from "../../events/log.js";
 import { buildCliAgentConfig } from "../../runs/agent-config.js";
 import {
   buildPrompt,
@@ -309,6 +310,11 @@ async function delegate(
 
   return jsonResult({
     run_id: record.id,
+    monitor: {
+      command: monitorCommandFor("run", record.id),
+      description:
+        "Pass to Claude Code's Monitor tool: one notification per event, and the stream ends when the run finishes.",
+    },
     name,
     status: current.status,
     queue_position: position,

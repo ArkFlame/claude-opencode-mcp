@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
+import { appendEvent, eventsFileForRun } from "../events/log.js";
 import type { Logger } from "../util/logger.js";
 import { type AttemptResult, KILL_GRACE_MS, runAttempt } from "./attempt.js";
 import { runErrorKind } from "./errors.js";
@@ -274,6 +275,10 @@ export class RunManager {
         record.status = "running";
         record.started = Date.now();
         record.last_activity = record.started;
+        appendEvent(eventsFileForRun(this.store.dir, record.id), "run_started", {
+          run_id: record.id,
+          attempt,
+        });
         record.pid = null;
         record.pgid = null;
         record.error = null;
@@ -364,6 +369,11 @@ export class RunManager {
     else if (end === "idle") record.error = `no output for ${Math.round(input.idleMs / 1000)}s`;
     else if (status === "failed")
       record.error = result?.errorMessage ?? "run ended without a final reply";
+    appendEvent(eventsFileForRun(this.store.dir, record.id), "run_done", {
+      run_id: record.id,
+      status: record.status,
+      error: record.error,
+    });
     this.persist(record);
     this.active.delete(record.id);
     this.options.logger.info("run finished", {

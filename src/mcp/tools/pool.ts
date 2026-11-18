@@ -3,6 +3,12 @@ import path from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { BridgeError } from "../../errors.js";
+import {
+  eventsFileForPool,
+  monitorCommandFor,
+  summarizeEvent,
+  waitForEvents,
+} from "../../events/log.js";
 import { AutoCommitter, MAX_INTERVAL_S, MIN_INTERVAL_S } from "../../git/auto-commit.js";
 import { DEFAULT_MAX_RETRIES, PER_FILE_CAP_DEFAULT, unitKeyOf } from "../../pool/core.js";
 import { isSupervisorAlive, listPoolDirs, startPool } from "../../pool/launch.js";
@@ -97,6 +103,13 @@ function poolOwnership(dir: string, me: RunOwner) {
     mine: view.mine,
     foreign: view.foreign,
   };
+}
+
+/** Pool directory for an id, or INVALID_ARGUMENT when no such pool exists. */
+function requirePoolDir(runsDir: string, id: string): string {
+  const dir = poolDirFor(runsDir, id);
+  if (!fs.existsSync(dir)) throw new BridgeError("INVALID_ARGUMENT", `unknown pool: ${id}`);
+  return dir;
 }
 
 /** Keys of open units (glob plus explicit paths) that have no unit state yet. */
@@ -214,6 +227,24 @@ export function registerPoolTools(server: McpServer, ctx: AppContext): void {
           .describe(
             "Requeue units that failed (not aborted). Applied by the live pool, or by a restarted one.",
           ),
+        ramp: z
+          .object({
+            start: z.number().int().min(1).max(50),
+            step: z.number().int().min(1).max(50),
+            max: z.number().int().min(1).max(50),
+            every_seconds: z.number().int().min(30).max(3_600),
+            backoff_on_failures: z.number().int().min(1).max(50).optional(),
+          })
+          .optional()
+          .describe(
+            "Start lanes at `start` and add `step` slots every `every_seconds` while recent failures stay below backoff_on_failures (default 2). A spike cuts `step` back and pauses ramping for 10 min. Applies when the pool starts.",
+          ),
+        stale_action: z
+          .enum(["report", "abort_requeue"])
+          .optional()
+          .describe(
+            "Silent workers: report as stale (default), or abort and requeue the unit (up to max_retries).",
+          ),
         max_retries: z
           .number()
           .int()
@@ -255,6 +286,18 @@ export function registerPoolTools(server: McpServer, ctx: AppContext): void {
             : ctx.runSettings.idleMs,
           forbid: validateForbid(args.forbid),
           maxRetries: args.max_retries ?? DEFAULT_MAX_RETRIES,
+          ...(args.ramp
+            ? {
+                ramp: {
+                  start: args.ramp.start,
+                  step: args.ramp.step,
+                  max: args.ramp.max,
+                  everySeconds: args.ramp.every_seconds,
+                  backoffOnFailures: args.ramp.backoff_on_failures ?? 2,
+                },
+              }
+            : {}),
+          staleAction: args.stale_action ?? "report",
           briefTemplate,
           runsDir: ctx.runSettings.runsDir,
           poolDir: poolDirFor(ctx.runSettings.runsDir, id),
@@ -292,6 +335,11 @@ export function registerPoolTools(server: McpServer, ctx: AppContext): void {
         const started = startPool(config);
         return {
           ...started,
+          monitor: {
+            command: monitorCommandFor("pool", id),
+            description:
+              "Pass to Claude Code's Monitor tool: one notification per unit finish, failure, stale worker or lane change, and the stream ends when the pool is done.",
+          },
           added_units: added,
           retry_failed: args.retry_failed === true,
           open_units: open.length,
@@ -334,9 +382,115 @@ export function registerPoolTools(server: McpServer, ctx: AppContext): void {
         const dirs = listPoolDirs(ctx.runSettings.runsDir)
           .filter((dir) => scope === "all" || poolOwnership(dir, me).mine)
           .slice(0, args.limit ?? 10);
+        const pools = dirs.map((dir) => ({ ...buildPoolStatus(dir), ...poolOwnership(dir, me) }));
+        const totals = { running: 0, queued: 0, done: 0, failed: 0, stale: 0, lane_cap: 0 };
+        for (const pool of pools) {
+          totals.running += pool.counts.running;
+          totals.queued += pool.counts.queued;
+          totals.done += pool.counts.done;
+          totals.failed += pool.counts.failed;
+          totals.stale += pool.stale_workers.length;
+          totals.lane_cap += pool.lanes.reduce((sum, lane) => sum + lane.effective_cap, 0);
+        }
+        return { scope, totals: { ...totals, slots_in_use: totals.running }, pools };
+      }),
+  );
+
+  server.registerTool(
+    "wait_pool",
+    {
+      title: "Wait for pool events",
+      description: [
+        "Block (bounded, up to timeout_seconds, max 600) until a pool event matches `until`, then return the events and counts.",
+        "until: any_finished (a unit finished or failed), failure, stale, or all_done (the pool is done).",
+        "Pass the returned cursor as since on the next call so each event arrives once. Without since, only events after this call count.",
+      ].join(" "),
+      inputSchema: {
+        pool_id: z.string().min(1).max(80),
+        until: z.enum(["any_finished", "all_done", "failure", "stale"]).optional(),
+        timeout_seconds: z.number().int().min(1).max(600).optional(),
+        since: z
+          .string()
+          .regex(/^\d{1,12}$/)
+          .optional()
+          .describe("Cursor from the previous wait_pool call."),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async (args) =>
+      guard(async () => {
+        const dir = requirePoolDir(ctx.runSettings.runsDir, args.pool_id);
+        const since = args.since === undefined ? undefined : Number(args.since);
+        const waited = await waitForEvents(eventsFileForPool(dir), {
+          until: args.until ?? "any_finished",
+          ...(since === undefined ? {} : { since }),
+          timeoutMs: (args.timeout_seconds ?? 300) * 1000,
+        });
+        const status = buildPoolStatus(dir);
         return {
-          scope,
-          pools: dirs.map((dir) => ({ ...buildPoolStatus(dir), ...poolOwnership(dir, me) })),
+          pool_id: args.pool_id,
+          timed_out: waited.timed_out,
+          cursor: String(waited.cursor),
+          lines: waited.events.map(summarizeEvent),
+          status: status.status,
+          counts: status.counts,
+          failed_units: status.failed_units,
+          stale_workers: status.stale_workers,
+        };
+      }),
+  );
+
+  server.registerTool(
+    "set_pool_cap",
+    {
+      title: "Change a live pool lane's cap",
+      description:
+        "Set one lane's concurrency cap on a running pool without restarting it. The live supervisor applies it on its next tick and emits a lane_cap_changed event. The next ramp step can move it again.",
+      inputSchema: {
+        pool_id: z.string().min(1).max(80),
+        lane: z.string().min(1).max(80),
+        cap: z.number().int().min(0).max(50),
+      },
+    },
+    async (args) =>
+      guard(async () => {
+        const dir = requirePoolDir(ctx.runSettings.runsDir, args.pool_id);
+        const state = readPoolState(dir);
+        if (!state?.lanes.some((lane) => lane.name === args.lane)) {
+          throw new BridgeError("INVALID_ARGUMENT", `unknown lane: ${args.lane}`);
+        }
+        const control = readControl(dir);
+        writeControl(dir, {
+          ...control,
+          lane_caps: { ...(control.lane_caps ?? {}), [args.lane]: args.cap },
+        });
+        const status = buildPoolStatus(dir);
+        return {
+          pool_id: args.pool_id,
+          lane: args.lane,
+          cap: args.cap,
+          supervisor_alive: status.supervisor_alive,
+          applied: status.supervisor_alive ? "next supervisor tick" : "pending: no live supervisor",
+        };
+      }),
+  );
+
+  server.registerTool(
+    "requeue_stale",
+    {
+      title: "Requeue stale workers",
+      description:
+        "Abort every silent worker of a pool and requeue its unit (up to max_retries per unit). Applied by the live supervisor on its next tick.",
+      inputSchema: { pool_id: z.string().min(1).max(80) },
+    },
+    async (args) =>
+      guard(async () => {
+        const dir = requirePoolDir(ctx.runSettings.runsDir, args.pool_id);
+        writeControl(dir, { ...readControl(dir), requeue_stale: true });
+        return {
+          pool_id: args.pool_id,
+          requested: true,
+          stale_workers: buildPoolStatus(dir).stale_workers,
         };
       }),
   );
