@@ -45,6 +45,7 @@ export const SERVER_INSTRUCTIONS = [
   "Read-only agents: deepseek-researcher, deepseek-reviewer. Editing agent: deepseek-coder. Test-running agent: deepseek-tester.",
   "After a coder session, call get_diff to inspect exactly what changed before reporting back to the user.",
   "Paths supplied to delegate_task are exploration hints, not boundaries.",
+  "Listening for results: call wait_any (or wait_pool for a pool) and let it block; it returns when a run finishes, so never write a shell for/while/sleep loop to poll runs or logs. After a timeout, call it again at most a few times, then check list_runs once and report. Read finished output with get_run.",
   "Shared checkouts: delegate_task with shared=true, or run_pool for a batch of unit files (pool_status to follow, usage_stats for model figures, auto_commit to commit and push while workers edit).",
 ].join(" ");
 
