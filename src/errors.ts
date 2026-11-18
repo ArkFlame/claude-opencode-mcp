@@ -25,6 +25,7 @@ export const BRIDGE_ERROR_CODES = [
   "DIFF_UNAVAILABLE",
   "NOT_GIT_REPOSITORY",
   "CONFIG_INVALID",
+  "DISK_LOW",
   "INTERNAL_ERROR",
 ] as const;
 

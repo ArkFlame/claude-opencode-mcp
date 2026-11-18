@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Logger } from "../util/logger.js";
 import { type AttemptResult, KILL_GRACE_MS, runAttempt } from "./attempt.js";
+import { runErrorKind } from "./errors.js";
 import { foreignCwdHolder } from "./lock.js";
 import { createRunOwner, type OwnerScope, ownershipOf, type RunOwner } from "./owner.js";
 import type { RunSettings } from "./settings.js";
@@ -309,6 +310,13 @@ export class RunManager {
     record.final_text = result?.text ? result.text : null;
     record.final_truncated = (result?.text.length ?? 0) > 256 * 1024;
     if (result?.lastLine) record.last_line = result.lastLine;
+    record.error_raw = result?.errorMessage ?? null;
+    record.error_kind = runErrorKind({
+      end: job.abort.signal.aborted ? "aborted" : end,
+      exitCode: record.exit_code,
+      rawError: record.error_raw,
+      done: status === "done",
+    });
     if (status === "aborted") record.error = "aborted";
     else if (end === "timeout")
       record.error = `hard timeout after ${Math.round(input.timeoutMs / 1000)}s`;

@@ -27,6 +27,7 @@ export function runRow(
     branch: record.branch,
     attempts: record.attempts,
     last_line: record.last_line,
+    error_kind: record.error_kind ?? null,
     queued_messages: queuedMessages,
   };
 }
@@ -55,6 +56,8 @@ export function runDetail(
     exit_code: record.exit_code,
     signal: record.signal,
     error: record.error,
+    error_kind: record.error_kind ?? null,
+    error_raw: record.error_raw ?? null,
     final: {
       status_line: summary.status,
       commit: summary.commit,

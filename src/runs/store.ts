@@ -55,6 +55,15 @@ export interface RunRecord {
   log_file: string;
   /** Pool id when the run is a unit worker of pool mode (owned by its supervisor). */
   pool?: string | null;
+  /** Classified failure (see errors.ts). Absent on records written before 1.6.0. */
+  error_kind?: string | null;
+  /** Raw error text as opencode reported it, before classification. */
+  error_raw?: string | null;
+  /** Hard timeout and idle limit of this run, in ms (1.6.0+). Absent: the settings apply. */
+  timeout_ms?: number | null;
+  idle_ms?: number | null;
+  /** Queued runs expire after this many ms without starting (1.6.0+). */
+  queue_ttl_ms?: number | null;
 }
 
 /** Persists one JSON file per run under the runs directory. Writes are atomic (tmp + rename). */
