@@ -36,12 +36,14 @@ import {
   SQLITE_BACKOFF_MS,
   SQLITE_CONSECUTIVE_STOP,
   SQLITE_RESTORE_AFTER,
+  UNIT_SCAN_MS,
   unitKeyOf,
 } from "./core.js";
 import {
   type PoolConfig,
   type PoolState,
   type PoolStatus,
+  readControl,
   readExitCode,
   readPoolState,
   readTail,
@@ -51,10 +53,11 @@ import {
   type UnitRecord,
   unitPaths,
   unitRecordId,
+  writeControl,
   writePoolState,
   writeUnit,
 } from "./state.js";
-import { scanUnits, type UnitFile } from "./units.js";
+import { listUnitFiles, readUnitFile, scanUnits, type UnitFile } from "./units.js";
 import { type SpawnRequest, spawnDetachedWorker, type WorkerHandle } from "./worker.js";
 
 export const TICK_MS = 2_000;
@@ -107,6 +110,9 @@ export class PoolSupervisor {
   private consecutiveSqlite = 0;
   private sqliteSuccesses = 0;
   private pausedReason: string | null = null;
+  private lastScan = Number.NEGATIVE_INFINITY;
+  /** Unit files seen without an open marker, with the mtime they had when checked. */
+  private readonly closedAt = new Map<string, number>();
 
   constructor(
     private readonly config: PoolConfig,
@@ -143,23 +149,111 @@ export class PoolSupervisor {
         lane.sqliteShrink = saved.sqlite_shrink ?? 0;
       }
     }
-    const open: UnitFile[] = [];
     for (const unit of units) {
       if (!unit.text.includes(this.config.marker)) continue;
       const key = unitKeyOf(unit.file);
       if (this.units.has(key)) {
         throw new Error(`two unit files map to the same key: ${key}`);
       }
-      open.push(unit);
       this.unitNames.set(key, rsNamesIn(unit.text));
       this.units.set(key, this.restore(key, unit.file, now));
     }
-    this.hubs = hubNames(
-      open
-        .filter((unit) => this.units.get(unitKeyOf(unit.file))?.state !== "done")
-        .map((unit) => this.unitNames.get(unitKeyOf(unit.file)) ?? new Set<string>()),
-    );
+    this.recomputeHubs();
     for (const unit of this.units.values()) this.save(unit);
+    this.persist();
+  }
+
+  /** Hub names come from the open (not done) units, so they follow units added later. */
+  private recomputeHubs(): void {
+    this.hubs = hubNames(
+      [...this.units.values()]
+        .filter((unit) => unit.state !== "done")
+        .map((unit) => this.unitNames.get(unit.key) ?? new Set<string>()),
+    );
+  }
+
+  /**
+   * Pick up unit files that appeared since the last scan, explicit add_units, and retry requests.
+   * The directory is rescanned at most every UNIT_SCAN_MS; the control file is read every tick.
+   * A unit that already has exit 0 is never added again.
+   */
+  private refresh(now: number): void {
+    const control = readControl(this.config.poolDir);
+    if (control.retry_failed) {
+      this.retryFailed();
+      writeControl(this.config.poolDir, { ...control, retry_failed: false });
+    }
+    // A message-only restart never adopts new units.
+    if (this.options.redeliverOnly || now - this.lastScan < UNIT_SCAN_MS) return;
+    this.lastScan = now;
+    let added = false;
+    for (const unit of this.discover(control.add_units)) {
+      this.addUnit(unit, now);
+      added = true;
+    }
+    if (added) this.persist();
+  }
+
+  /** Open unit files that are not yet tracked, from the glob and the explicit list. */
+  private discover(explicit: string[]): UnitFile[] {
+    const found: UnitFile[] = [];
+    const candidates = [
+      ...listUnitFiles(this.config.unitsGlob),
+      ...explicit.map((file) => ({ file, mtimeMs: this.mtimeOf(file) })),
+    ];
+    for (const { file, mtimeMs } of candidates) {
+      if (this.units.has(unitKeyOf(file))) continue;
+      if (this.closedAt.get(file) === mtimeMs) continue;
+      const unit = readUnitFile(file);
+      if (!unit || !unit.text.includes(this.config.marker)) {
+        this.closedAt.set(file, mtimeMs);
+        continue;
+      }
+      found.push(unit);
+    }
+    return found;
+  }
+
+  private mtimeOf(file: string): number {
+    try {
+      return fs.statSync(file).mtimeMs;
+    } catch {
+      return Number.NaN;
+    }
+  }
+
+  private addUnit(unit: UnitFile, now: number): void {
+    const key = unitKeyOf(unit.file);
+    this.unitNames.set(key, rsNamesIn(unit.text));
+    const record = this.restore(key, unit.file, now);
+    this.units.set(key, record);
+    this.recomputeHubs();
+    this.save(record);
+  }
+
+  /** Requeue every failed unit except those the caller aborted. Exit-0 units are untouched. */
+  private retryFailed(): void {
+    let requeued = false;
+    for (const unit of this.units.values()) {
+      if (unit.state !== "failed" || unit.error === "aborted") continue;
+      fs.rmSync(unitPaths(this.config.poolDir, unit.key).exit, { force: true });
+      unit.state = "queued";
+      unit.lane = null;
+      unit.pid = null;
+      unit.pgid = null;
+      unit.exitCode = null;
+      unit.error = null;
+      unit.errorKind = null;
+      unit.errorRaw = null;
+      unit.finished = null;
+      unit.timeouts = 0;
+      unit.sqliteRetries = 0;
+      unit.notBefore = null;
+      this.save(unit);
+      requeued = true;
+    }
+    // A pool that already reached done must run again to pick the requeued units up.
+    if (requeued && this.status === "done") this.status = "running";
     this.persist();
   }
 
@@ -234,6 +328,7 @@ export class PoolSupervisor {
       this.stop("stopped", "stop requested", now);
       return false;
     }
+    this.refresh(now);
     this.syncMessages(now);
     for (const unit of [...this.units.values()]) this.monitor(unit, now);
     if (this.status !== "running") return false;

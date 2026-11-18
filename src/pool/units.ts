@@ -37,6 +37,40 @@ export function globToRegExp(pattern: string): RegExp {
   return new RegExp(`^${source}$`);
 }
 
+/** File names and mtimes matching units_glob, sorted by name. No file contents are read. */
+export function listUnitFiles(unitsGlob: string): Array<{ file: string; mtimeMs: number }> {
+  const { dir, pattern } = splitUnitsGlob(unitsGlob);
+  const matcher = globToRegExp(pattern);
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const files: Array<{ file: string; mtimeMs: number }> = [];
+  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    if (!entry.isFile() || !matcher.test(entry.name)) continue;
+    const file = path.join(dir, entry.name);
+    try {
+      files.push({ file, mtimeMs: fs.statSync(file).mtimeMs });
+    } catch {
+      // Removed between readdir and stat: skip it.
+    }
+    if (files.length > MAX_UNIT_FILES) break;
+  }
+  return files;
+}
+
+/** Text of one unit file, bounded like scanUnits. Null when it cannot be read. */
+export function readUnitFile(file: string): UnitFile | null {
+  try {
+    const buffer = fs.readFileSync(file);
+    return { file, text: buffer.subarray(0, MAX_UNIT_BYTES).toString("utf8") };
+  } catch {
+    return null;
+  }
+}
+
 /** Read every regular file matching units_glob, sorted by name. Oversized files are truncated. */
 export function scanUnits(unitsGlob: string): UnitFile[] {
   const { dir, pattern } = splitUnitsGlob(unitsGlob);

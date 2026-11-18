@@ -43,6 +43,8 @@ export interface PoolStatusView {
   eta_minutes: number | null;
 }
 
+const NON_UNIT_JSON = new Set(["pool.json", "config.json", "control.json"]);
+
 function readUnits(poolDir: string): UnitRecord[] {
   let names: string[];
   try {
@@ -52,7 +54,7 @@ function readUnits(poolDir: string): UnitRecord[] {
   }
   const units: UnitRecord[] = [];
   for (const name of names) {
-    if (!name.endsWith(".json") || name === "pool.json" || name === "config.json") continue;
+    if (!name.endsWith(".json") || NON_UNIT_JSON.has(name)) continue;
     const unit = readUnit(poolDir, name.slice(0, -".json".length));
     if (unit && typeof unit.key === "string") units.push(unit);
   }

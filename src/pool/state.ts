@@ -123,6 +123,29 @@ export function unitPaths(poolDir: string, key: string): UnitPaths {
   };
 }
 
+/**
+ * Requests written by a caller to a live supervisor: explicit unit files to add, and whether
+ * failed units should be requeued. The supervisor clears retry_failed once it has applied it.
+ */
+export interface PoolControl {
+  add_units: string[];
+  retry_failed: boolean;
+}
+
+export function readControl(poolDir: string): PoolControl {
+  const value = readJson<Partial<PoolControl>>(path.join(poolDir, "control.json"));
+  return {
+    add_units: Array.isArray(value?.add_units)
+      ? value.add_units.filter((entry): entry is string => typeof entry === "string")
+      : [],
+    retry_failed: value?.retry_failed === true,
+  };
+}
+
+export function writeControl(poolDir: string, control: PoolControl): void {
+  writeJsonAtomic(path.join(poolDir, "control.json"), control);
+}
+
 export function stopFileFor(poolDir: string): string {
   return path.join(poolDir, "stop");
 }

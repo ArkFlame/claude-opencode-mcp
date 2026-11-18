@@ -4,17 +4,26 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { BridgeError } from "../../errors.js";
 import { AutoCommitter, MAX_INTERVAL_S, MIN_INTERVAL_S } from "../../git/auto-commit.js";
-import { DEFAULT_MAX_RETRIES, PER_FILE_CAP_DEFAULT } from "../../pool/core.js";
+import { DEFAULT_MAX_RETRIES, PER_FILE_CAP_DEFAULT, unitKeyOf } from "../../pool/core.js";
 import { isSupervisorAlive, listPoolDirs, startPool } from "../../pool/launch.js";
 import {
   type LaneConfig,
   type PoolConfig,
   poolDirFor,
   poolIdFor,
+  readControl,
   readPoolState,
+  unitPaths,
+  writeControl,
 } from "../../pool/state.js";
 import { buildPoolStatus } from "../../pool/status.js";
-import { scanUnits, splitUnitsGlob } from "../../pool/units.js";
+import {
+  listUnitFiles,
+  readUnitFile,
+  scanUnits,
+  splitUnitsGlob,
+  type UnitFile,
+} from "../../pool/units.js";
 import { validateForbid } from "../../runs/brief.js";
 import { assertModelId, assertRunName } from "../../runs/names.js";
 import { assertMutable, filterByScope, ownershipOf, type RunOwner } from "../../runs/owner.js";
@@ -90,6 +99,31 @@ function poolOwnership(dir: string, me: RunOwner) {
   };
 }
 
+/** Keys of open units (glob plus explicit paths) that have no unit state yet. */
+function unitsNeedingState(
+  poolDir: string,
+  unitsGlob: string,
+  marker: string,
+  explicit: string[],
+): string[] {
+  const files: UnitFile[] = [];
+  for (const entry of listUnitFiles(unitsGlob)) {
+    const unit = readUnitFile(entry.file);
+    if (unit) files.push(unit);
+  }
+  for (const file of explicit) {
+    const unit = readUnitFile(file);
+    if (unit) files.push(unit);
+  }
+  const keys = new Set<string>();
+  for (const unit of files) {
+    if (!unit.text.includes(marker)) continue;
+    const key = unitKeyOf(unit.file);
+    if (!fs.existsSync(unitPaths(poolDir, key).state)) keys.add(key);
+  }
+  return [...keys].sort();
+}
+
 export function registerPoolTools(server: McpServer, ctx: AppContext): void {
   const committer = new AutoCommitter({ runsDir: ctx.runSettings.runsDir });
 
@@ -101,6 +135,7 @@ export function registerPoolTools(server: McpServer, ctx: AppContext): void {
         "Run one OpenCode worker per open unit file (a file that still contains `marker`) in a shared checkout, with lanes of models and per-lane caps.",
         "Units whose `<unit>.exit` is 0 are skipped. Units naming the same exclusive .rs file never run together; generic and hub files are capped by per_file_cap.",
         "The pool runs in a detached supervisor, so it survives this MCP server. Calling again with the same units_glob and cwd adopts the live pool.",
+        "The supervisor rescans units_glob every 5 s, so new open unit files join the pool without a new call; add_units adds explicit paths. A unit with exit 0 is never run again.",
         "Provider limit errors requeue the unit, shrink that lane by one and back off; six consecutive hits stop the pool.",
         "Opencode sqlite failures requeue the unit with backoff up to max_retries and shrink its lane (never below one slot); six in a row stop the pool. Low free disk (CLAUDE_OPENCODE_MIN_FREE_MB) pauses launches.",
       ].join(" "),
@@ -157,6 +192,19 @@ export function registerPoolTools(server: McpServer, ctx: AppContext): void {
           .max(20)
           .optional()
           .describe('Commands workers must not run (default ["git", "cargo"]).'),
+        add_units: z
+          .array(z.string().min(1).max(4_096))
+          .max(500)
+          .optional()
+          .describe(
+            "Absolute unit file paths to add to this pool, outside units_glob if needed. Picked up on the next scan.",
+          ),
+        retry_failed: z
+          .boolean()
+          .optional()
+          .describe(
+            "Requeue units that failed (not aborted). Applied by the live pool, or by a restarted one.",
+          ),
         max_retries: z
           .number()
           .int()
@@ -218,9 +266,22 @@ export function registerPoolTools(server: McpServer, ctx: AppContext): void {
           );
         }
         assertDiskFree([cwd, opencodeDataDir(ctx.env)], ctx.env);
+        const explicit = (args.add_units ?? []).map((file) => {
+          if (!path.isAbsolute(file))
+            throw new BridgeError("INVALID_PATH", `add_units must be absolute: ${file}`);
+          return file;
+        });
+        const control = readControl(config.poolDir);
+        writeControl(config.poolDir, {
+          add_units: [...new Set([...control.add_units, ...explicit])],
+          retry_failed: control.retry_failed || args.retry_failed === true,
+        });
+        const added = unitsNeedingState(config.poolDir, args.units_glob, args.marker, explicit);
         const started = startPool(config);
         return {
           ...started,
+          added_units: added,
+          retry_failed: args.retry_failed === true,
           open_units: open.length,
           skipped_closed: units.length - open.length,
           lanes: lanes.map((lane) => ({ name: lane.name, model: lane.model, cap: lane.cap })),

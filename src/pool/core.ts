@@ -21,6 +21,8 @@ export const SQLITE_RESTORE_AFTER = 5;
 /** Requeue delay after a sqlite failure, multiplied by the unit's retry count. */
 export const SQLITE_BACKOFF_MS = 30_000;
 export const DEFAULT_MAX_RETRIES = 2;
+/** Minimum gap between unit-directory rescans of a running pool. */
+export const UNIT_SCAN_MS = 5_000;
 export const STALE_LOG_MS = 300_000;
 export const RATE_WINDOW_MS = 600_000;
 export const KILL_GRACE_MS = 5_000;

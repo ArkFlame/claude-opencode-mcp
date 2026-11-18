@@ -6,11 +6,13 @@ import { KILL_GRACE_MS } from "../../src/pool/core.js";
 import {
   type PoolConfig,
   poolDirFor,
+  readControl,
   readPoolState,
   readUnit,
   stopFileFor,
   unitPaths,
   unitRecordId,
+  writeControl,
   writeUnit,
 } from "../../src/pool/state.js";
 import { buildPoolStatus } from "../../src/pool/status.js";
@@ -460,5 +462,55 @@ describe("sqlite failures", () => {
       expect.objectContaining({ unit: "a", exit_code: 3, error_kind: "exit" }),
     ]);
     expect(view.failed_units[0]?.log_path).toBe(unitPaths(config.poolDir, "a").log);
+  });
+});
+
+describe("unit rescan and controls", () => {
+  it("adopts unit files that appear after start, at most once per 5 s scan", () => {
+    const { ops, supervisor, unitsDir } = boot({ "a.md": OPEN });
+    supervisor.tick();
+    fs.writeFileSync(path.join(unitsDir, "late.md"), OPEN);
+    ops.clock += 1_000;
+    supervisor.tick();
+    expect(supervisor.unit("late")).toBeUndefined();
+    ops.clock += 4_000;
+    supervisor.tick();
+    expect(supervisor.unit("late")?.state).toBe("running");
+    expect(ops.spawns.map((entry) => entry.key)).toContain("late");
+  });
+
+  it("adds explicit add_units paths outside the glob from the control file", () => {
+    const { ops, supervisor, config, root } = boot({ "a.md": OPEN });
+    supervisor.tick();
+    const outside = path.join(root, "elsewhere.md");
+    fs.writeFileSync(outside, OPEN);
+    writeControl(config.poolDir, { add_units: [outside], retry_failed: false });
+    ops.clock += 5_000;
+    supervisor.tick();
+    expect(supervisor.unit("elsewhere")).toBeDefined();
+    expect(ops.spawns.map((entry) => entry.key)).toContain("elsewhere");
+  });
+
+  it("never runs a unit that already has exit 0", () => {
+    const { ops, supervisor, unitsDir, config } = boot({ "a.md": OPEN });
+    supervisor.tick();
+    fs.writeFileSync(path.join(unitsDir, "finished.md"), OPEN);
+    fs.writeFileSync(unitPaths(config.poolDir, "finished").exit, "0\n");
+    ops.clock += 5_000;
+    supervisor.tick();
+    expect(supervisor.unit("finished")?.state).toBe("done");
+    expect(ops.spawns.map((entry) => entry.key)).not.toContain("finished");
+  });
+
+  it("requeues failed units on a retry_failed request and clears the request", () => {
+    const { ops, supervisor, config } = boot({ "a.md": OPEN });
+    supervisor.tick();
+    ops.end("a", 3);
+    supervisor.tick();
+    expect(supervisor.unit("a")?.state).toBe("failed");
+    writeControl(config.poolDir, { add_units: [], retry_failed: true });
+    supervisor.tick();
+    expect(ops.spawns.filter((entry) => entry.key === "a")).toHaveLength(2);
+    expect(readControl(config.poolDir).retry_failed).toBe(false);
   });
 });
