@@ -177,3 +177,16 @@ Limits: background CLI runs that are not pool units are not supported and are re
 between two processes that write the same inbox is last-writer-wins for the rewrite window, so
 keep one MCP server per runs directory. Messages are untrusted instructions; `list_messages`
 shows only a 200-character preview.
+
+## Multiple Claude sessions
+
+Pools belong to the Claude Code session that started them (see the README section of the same name).
+
+- `run_pool` stamps the pool with the session's `owner_id` and `owner_label`. Unit workers inherit the owner, so their run records carry it too.
+- `pool_status` lists this session's pools by default. `scope: "all"` lists every session's pools, each with `owner_label` and `mine`. A single `pool_id` is always readable and reports `foreign`.
+- `run_pool` on a pool that another live session is running is refused, naming its owner. Pass `force: true` to take it over.
+- `abort_all` stops only this session's pool supervisors. A supervisor of another live session is never signalled unless `scope: "all"` and `force: true` are both passed.
+- A pool supervisor whose owner is alive is never reaped as stale, whichever session started it.
+- Queued messages record their owner. `list_messages` shows this session's messages by default, and `cancel_message` refuses another session's message unless `force: true` is passed.
+- `usage_stats` with the default `scope: "mine"` counts only sessions titled with this session's run ids, the `<name> (<run id>)` titles that delegate_task and pool workers use.
+

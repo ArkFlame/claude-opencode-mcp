@@ -280,6 +280,10 @@ Returns `{ source, files, diff, truncated, note? }`.
 
 Stops a running delegation. Safe to call when the session is idle.
 
+### `whoami`
+
+This session's owner identity (`id`, `label`, `pid`, `ppid`), the number of runs it owns and the number owned by other sessions, and the shared runs directory. See [Multiple Claude sessions](#multiple-claude-sessions).
+
 ### `list_agents`
 
 Lists the built-in agents plus project-local agents from
@@ -450,6 +454,27 @@ Full reference: [docs/configuration.md](docs/configuration.md).
   `get_session` reports live status when a server is running.
 - Logs: `~/.local/state/claude-opencode-mcp/bridge.log` (rotated at 5 MB).
   Set `CLAUDE_OPENCODE_LOG=debug|info|warn|error|silent`.
+
+## Multiple Claude sessions
+
+Every Claude Code session starts its own MCP server, and all servers share one runs directory. Runs belong to the session that started them, so one session cannot see or stop another session's work by accident.
+
+- `list_runs`, `wait_any`, `pool_status`, `usage_stats` and `list_messages` default to `scope: "mine"`. Pass `scope: "all"` to see every session. Each row carries `owner_label` and `mine`, and `list_runs` adds an `owners` summary.
+- `abort_run`, `queue_message`, `cancel_message` and `run_pool` on an existing pool refuse a run owned by another session, and the error names its owner. Pass `force: true` to act on it.
+- `get_run` reads another session's run and marks it `foreign: true`.
+- `abort_all` aborts only this session's runs. `scope: "all"` together with `force: true` aborts every session's runs.
+- A shared cwd is exclusive across sessions. A run waits while another live session runs in that cwd, and `delegate_task` reports it under `collision`.
+- Stale cleanup marks a run stale only when its owner process is gone.
+- `whoami` returns this session's owner id, label and run counts.
+
+Identity: the owner id is `<ppid>-<start time of ppid>` on Linux, so a restarted MCP server under the same Claude Code process keeps its id and re-adopts its live runs. The label is the MCP client name plus a short id, for example `claude-code#a1b2`.
+
+| Variable | Effect |
+|---|---|
+| `CLAUDE_OPENCODE_OWNER` | Owner id used verbatim (pin a session identity yourself). |
+| `CLAUDE_OPENCODE_LABEL` | Owner label used verbatim. |
+
+Records written by versions before 1.5.0 have no owner. They count as this session's only when their `owner_pid` is this server, and they appear under `scope: "all"`.
 
 ## Troubleshooting
 

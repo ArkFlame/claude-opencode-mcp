@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-11-17
+### Added
+- Each Claude Code session has an owner identity: `CLAUDE_OPENCODE_OWNER` overrides the id and `CLAUDE_OPENCODE_LABEL` the label. The default id is the parent process and its start time, so a restarted server re-adopts its runs.
+- Run, pool and queued-message records carry `owner_id` and `owner_label`. Records written by earlier versions stay readable as legacy.
+- `scope: "mine" | "all"` (default `mine`) on `list_runs`, `wait_any`, `pool_status`, `usage_stats` and `list_messages`. `list_runs` with `scope: "all"` adds an `owners` summary.
+- `abort_run`, `queue_message`, `cancel_message` and `run_pool` refuse another session's run or pool unless `force: true`. `get_run` reads it and reports `foreign: true`.
+- `abort_all` clears only this session's runs and pools. `scope: "all"` with `force: true` clears every session's.
+- `delegate_task` reports a live run of another session in the same cwd under `collision`, and that run blocks an exclusive run the same way a local one does.
+- `whoami` tool.
+
+### Changed
+- Stale cleanup marks a run stale only when its owner process is gone. Live runs of other sessions are never reaped.
+- `usage_stats` defaults to this session's runs.
+
 ## [1.4.0] - 2026-11-17
 ### Added
 - `queue_message`: queue a follow-up for a pool unit or an OpenCode session. `when_idle` waits for the current attempt; `now` interrupts a running pool unit and redelivers on the same session. Messages are stored per run in an atomic JSON-lines inbox with a priority order, three delivery attempts and a cancel path.
