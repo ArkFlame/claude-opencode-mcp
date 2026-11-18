@@ -187,6 +187,15 @@ export function registerPoolTools(server: McpServer, ctx: AppContext): void {
           .max(86_400)
           .optional()
           .describe(`Hard timeout per worker in seconds (default ${DEFAULT_TIMEOUT_S}).`),
+        idle_timeout_seconds: z
+          .number()
+          .int()
+          .min(60)
+          .max(86_400)
+          .optional()
+          .describe(
+            "Kill a worker whose log has not grown for this long (default CLAUDE_OPENCODE_IDLE_SECONDS, 300). Stale workers are reported after the same limit.",
+          ),
         forbid: z
           .array(z.string().max(40))
           .max(20)
@@ -241,6 +250,9 @@ export function registerPoolTools(server: McpServer, ctx: AppContext): void {
           lanes,
           perFileCap: args.per_file_cap ?? PER_FILE_CAP_DEFAULT,
           timeoutMs: (args.timeout_s ?? DEFAULT_TIMEOUT_S) * 1000,
+          idleMs: args.idle_timeout_seconds
+            ? args.idle_timeout_seconds * 1000
+            : ctx.runSettings.idleMs,
           forbid: validateForbid(args.forbid),
           maxRetries: args.max_retries ?? DEFAULT_MAX_RETRIES,
           briefTemplate,

@@ -79,7 +79,8 @@ describe("runAttempt watchdog", () => {
     const started = Date.now();
     const result = await runAttempt(attemptSpec(dir), { timeoutMs: 60_000, idleMs: 1_000 });
     expect(result.end).toBe("idle");
-    expect(Date.now() - started).toBeLessThan(10_000);
+    // The kill also waits IDLE_CONFIRM_MS (10 s) after the last log growth, so allow for it.
+    expect(Date.now() - started).toBeLessThan(15_000);
     const grandchild = Number(fs.readFileSync(pidFile, "utf8"));
     expect(await waitUntil(() => !isAlive(grandchild))).toBe(true);
     expect(result.text).toBe("");

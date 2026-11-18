@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { etaFor, isStale } from "./core.js";
+import { etaFor, isStale, STALE_LOG_MS } from "./core.js";
 import { isSupervisorAlive } from "./launch.js";
 import { type PoolState, readPoolState, readUnit, type UnitRecord, unitPaths } from "./state.js";
 
@@ -61,6 +61,18 @@ function readUnits(poolDir: string): UnitRecord[] {
   return units.sort((a, b) => a.key.localeCompare(b.key));
 }
 
+/** Pool idle limit from config.json; the 300 s default applies to pools made before it existed. */
+function idleLimitOf(poolDir: string): number {
+  try {
+    const config = JSON.parse(fs.readFileSync(path.join(poolDir, "config.json"), "utf8")) as {
+      idleMs?: unknown;
+    };
+    return typeof config.idleMs === "number" ? config.idleMs : STALE_LOG_MS;
+  } catch {
+    return STALE_LOG_MS;
+  }
+}
+
 function logIdleMs(poolDir: string, key: string, now: number): number | null {
   try {
     return now - fs.statSync(unitPaths(poolDir, key).log).mtimeMs;
@@ -73,6 +85,7 @@ function logIdleMs(poolDir: string, key: string, now: number): number | null {
 export function buildPoolStatus(poolDir: string, now = Date.now()): PoolStatusView {
   const state = readPoolState(poolDir);
   const units = readUnits(poolDir);
+  const idleLimit = idleLimitOf(poolDir);
   const alive = isSupervisorAlive(state?.supervisor_pid ?? null);
   const counts = { total: units.length, queued: 0, running: 0, done: 0, failed: 0 };
   for (const unit of units) {
@@ -106,7 +119,7 @@ export function buildPoolStatus(poolDir: string, now = Date.now()): PoolStatusVi
   for (const unit of units) {
     if (unit.state !== "running") continue;
     const idle = logIdleMs(poolDir, unit.key, now);
-    if (idle !== null && isStale(now - idle, now)) {
+    if (idle !== null && isStale(now - idle, now, idleLimit)) {
       stale.push({ key: unit.key, lane: unit.lane, idle_seconds: Math.round(idle / 1000) });
     }
   }

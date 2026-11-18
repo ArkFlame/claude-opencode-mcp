@@ -48,7 +48,10 @@ export function resolveRunSettings(
 ): RunSettings {
   const runs = config.runs;
   const timeoutS = envInt(env, "CLAUDE_OPENCODE_TIMEOUT", 1, 86_400) ?? runs.timeout;
-  const idleS = envInt(env, "CLAUDE_OPENCODE_IDLE_TIMEOUT", 1, 86_400) ?? runs.idleTimeout;
+  const idleS =
+    envInt(env, "CLAUDE_OPENCODE_IDLE_SECONDS", 1, 86_400) ??
+    envInt(env, "CLAUDE_OPENCODE_IDLE_TIMEOUT", 1, 86_400) ??
+    runs.idleTimeout;
   const envMaxParallel = envInt(env, "CLAUDE_OPENCODE_MAX_PARALLEL", 1, 64);
   const maxParallel = envMaxParallel ?? runs.maxParallel;
   const maxParallelSource =

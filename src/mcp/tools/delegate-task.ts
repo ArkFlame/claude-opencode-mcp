@@ -130,6 +130,15 @@ export function registerDelegateTask(server: McpServer, ctx: AppContext): void {
           .max(86_400)
           .optional()
           .describe("Hard timeout for this run in seconds (default from CLAUDE_OPENCODE_TIMEOUT)."),
+        idle_timeout_seconds: z
+          .number()
+          .int()
+          .positive()
+          .max(86_400)
+          .optional()
+          .describe(
+            "Kill after this many seconds without log output (default CLAUDE_OPENCODE_IDLE_SECONDS, 300).",
+          ),
         queue_ttl_seconds: z
           .number()
           .int()
@@ -191,6 +200,7 @@ async function delegate(
     timeout_seconds?: number | undefined;
     wait_seconds?: number | undefined;
     queue_ttl_seconds?: number | undefined;
+    idle_timeout_seconds?: number | undefined;
   },
   requestIdValue: string,
 ) {
@@ -255,7 +265,7 @@ async function delegate(
     modelNote: resolved.note,
     allowSharedCwd: args.allow_shared_cwd === true || shared,
     timeoutMs,
-    idleMs: settings.idleMs,
+    idleMs: args.idle_timeout_seconds ? args.idle_timeout_seconds * 1000 : settings.idleMs,
     queueTtlMs: queueTtl(args),
   });
   ctx.logger.info("run queued", {

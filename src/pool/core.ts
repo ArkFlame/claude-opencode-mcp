@@ -24,6 +24,8 @@ export const DEFAULT_MAX_RETRIES = 2;
 /** Minimum gap between unit-directory rescans of a running pool. */
 export const UNIT_SCAN_MS = 5_000;
 export const STALE_LOG_MS = 300_000;
+/** A log must also have been silent this long before an idle kill (double-check against races). */
+export const IDLE_CONFIRM_MS = 10_000;
 export const RATE_WINDOW_MS = 600_000;
 export const KILL_GRACE_MS = 5_000;
 /** A unit lost without an exit code (supervisor restarted, process vanished) gets this many attempts. */
@@ -129,8 +131,8 @@ export function isLimitFailure(exitCode: number | null, tail: string): boolean {
   return isLimitTail(tail) && (exitCode !== 0 || !hasStatusLine(tail));
 }
 
-export function isStale(lastActivityMs: number, now: number): boolean {
-  return now - lastActivityMs > STALE_LOG_MS;
+export function isStale(lastActivityMs: number, now: number, limitMs = STALE_LOG_MS): boolean {
+  return now - lastActivityMs > limitMs;
 }
 
 export function etaFor(

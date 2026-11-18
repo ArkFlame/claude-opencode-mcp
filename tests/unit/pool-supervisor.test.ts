@@ -514,3 +514,19 @@ describe("unit rescan and controls", () => {
     expect(readControl(config.poolDir).retry_failed).toBe(false);
   });
 });
+
+describe("pool idle kill", () => {
+  it("kills a worker whose log has been silent past the idle limit", () => {
+    const { ops, supervisor, config } = boot({ "a.md": OPEN });
+    ops.clock = Date.now();
+    supervisor.tick();
+    const log = unitPaths(config.poolDir, "a").log;
+    fs.writeFileSync(log, "");
+    const old = (ops.clock - 400_000) / 1000;
+    fs.utimesSync(log, old, old);
+    ops.clock += 1_000;
+    supervisor.tick();
+    expect(supervisor.unit("a")?.state).toBe("killing");
+    expect(supervisor.unit("a")?.error).toBe("idle");
+  });
+});

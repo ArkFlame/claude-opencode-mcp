@@ -1,5 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import fs from "node:fs";
+import { IDLE_CONFIRM_MS } from "../pool/core.js";
 import { stripAnsi } from "../util/text.js";
 import { killProcessGroup } from "./store.js";
 
@@ -19,6 +20,8 @@ export interface AttemptSpec {
 export interface AttemptLimits {
   timeoutMs: number;
   idleMs: number;
+  /** Silence the log must also have shown before an idle stop. Default IDLE_CONFIRM_MS. */
+  confirmMs?: number;
 }
 
 export type AttemptEnd = "exit" | "timeout" | "idle" | "aborted" | "spawn-error";
@@ -86,6 +89,9 @@ export function runAttempt(
     const log = fs.createWriteStream(spec.logFile, { flags: "a", mode: 0o600 });
     const startedAt = Date.now();
     let lastActivity = startedAt;
+    let logSize = -1;
+    let lastGrowth = startedAt;
+    let completedIdle = false;
     let end: AttemptEnd | null = null;
     let settled = false;
     let stdoutBuffer = "";
@@ -145,11 +151,34 @@ export function runAttempt(
       terminateGroup();
     };
 
+    // Log growth counts as activity even when no complete line reached stdout.
+    const sampleLog = (now: number) => {
+      let size: number;
+      try {
+        size = fs.statSync(spec.logFile).size;
+      } catch {
+        return;
+      }
+      if (size <= logSize) return;
+      logSize = size;
+      lastGrowth = now;
+      lastActivity = now;
+    };
+
     const watchdog = setInterval(
       () => {
         const now = Date.now();
-        if (now - startedAt >= limits.timeoutMs) stop("timeout");
-        else if (now - lastActivity >= limits.idleMs) stop("idle");
+        sampleLog(now);
+        if (now - startedAt >= limits.timeoutMs) {
+          stop("timeout");
+        } else if (
+          now - lastActivity >= limits.idleMs &&
+          now - lastGrowth >= (limits.confirmMs ?? IDLE_CONFIRM_MS)
+        ) {
+          // Silent, but a final assistant text exists: the run finished, so it completes.
+          completedIdle = texts.latest().length > 0;
+          stop(completedIdle ? "exit" : "idle");
+        }
       },
       Math.max(20, Math.min(1_000, Math.floor(limits.idleMs / 4))),
     );
@@ -210,7 +239,7 @@ export function runAttempt(
         (code !== 0 && stderrTail.trim() ? stripAnsi(stderrTail).trim().slice(-800) : null);
       resolve({
         end: reason,
-        exitCode: code,
+        exitCode: completedIdle ? 0 : code,
         signal,
         text: texts.latest(),
         errorMessage: reason === "exit" && code === 0 ? null : failureDetail,

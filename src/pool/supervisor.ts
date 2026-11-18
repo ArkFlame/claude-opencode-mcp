@@ -24,6 +24,7 @@ import {
   canStart,
   DEFAULT_MAX_RETRIES,
   hubNames,
+  IDLE_CONFIRM_MS,
   isLimitFailure,
   KILL_GRACE_MS,
   type LaneState,
@@ -36,6 +37,7 @@ import {
   SQLITE_BACKOFF_MS,
   SQLITE_CONSECUTIVE_STOP,
   SQLITE_RESTORE_AFTER,
+  STALE_LOG_MS,
   UNIT_SCAN_MS,
   unitKeyOf,
 } from "./core.js";
@@ -481,6 +483,26 @@ export class PoolSupervisor {
       unit.timeouts += 1;
       unit.error = "hard timeout";
       this.beginKill(unit, now);
+      return;
+    }
+    // Silent past the idle limit, and the log has not moved for IDLE_CONFIRM_MS: kill it.
+    const silentMs = now - this.logMtime(unit.key, now);
+    if (
+      unit.state === "running" &&
+      silentMs > (this.config.idleMs ?? STALE_LOG_MS) &&
+      silentMs >= IDLE_CONFIRM_MS
+    ) {
+      unit.error = "idle";
+      this.beginKill(unit, now);
+    }
+  }
+
+  /** Last write time of a unit's log, or `now` when the log does not exist yet. */
+  private logMtime(key: string, now: number): number {
+    try {
+      return fs.statSync(unitPaths(this.config.poolDir, key).log).mtimeMs;
+    } catch {
+      return now;
     }
   }
 

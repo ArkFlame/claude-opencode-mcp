@@ -18,6 +18,8 @@ export interface PoolConfig {
   lanes: LaneConfig[];
   perFileCap: number;
   timeoutMs: number;
+  /** Idle limit before a silent worker is stale or killed. Default 300 s (absent on older pools). */
+  idleMs?: number;
   forbid: string[];
   /** Attempts after a sqlite failure before the unit fails. Default 2 (absent on older pools). */
   maxRetries?: number;
