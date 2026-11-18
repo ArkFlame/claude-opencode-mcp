@@ -43,6 +43,8 @@ export interface UnitRecord {
   killedAt: number | null;
   exitCode: number | null;
   error: string | null;
+  /** Queued message id this unit is delivering (resume attempt), or null. */
+  message?: string | null;
 }
 
 export type PoolStatus = "running" | "done" | "stopped" | "limit-stopped";

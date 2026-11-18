@@ -1,5 +1,18 @@
 import fs from "node:fs";
 import path from "node:path";
+import {
+  inboxFileFor,
+  mutateMessage,
+  nextDeliverable,
+  type QueuedMessage,
+  queuedOrder,
+  readInbox,
+  refundAttempt,
+  settleAttempt,
+  startAttempt,
+  writeInbox,
+} from "../queue/inbox.js";
+import { buildResumeArgs, findSessionIdByTitle, unitSessionTitles } from "../queue/resume.js";
 import { sharedSection } from "../runs/brief.js";
 import { buildRunArgs } from "../runs/manager.js";
 import { isProcessAlive, killProcessGroup, RunStore } from "../runs/store.js";
@@ -31,6 +44,7 @@ import {
   syncRunRecord,
   type UnitRecord,
   unitPaths,
+  unitRecordId,
   writePoolState,
   writeUnit,
 } from "./state.js";
@@ -38,6 +52,8 @@ import { scanUnits, type UnitFile } from "./units.js";
 import { type SpawnRequest, spawnDetachedWorker, type WorkerHandle } from "./worker.js";
 
 export const TICK_MS = 2_000;
+/** Error recorded on a unit whose running attempt is interrupted by a "now" message. */
+export const REDELIVER_NOW = "redeliver now";
 
 /** Side effects the supervisor needs. Tests replace them; production uses the real process APIs. */
 export interface SupervisorOps {
@@ -45,6 +61,8 @@ export interface SupervisorOps {
   spawn(request: SpawnRequest): WorkerHandle;
   isAlive(pid: number): boolean;
   signal(pgid: number, signal: NodeJS.Signals): void;
+  /** OpenCode session of a unit's latest run; needed to resume it with a queued message. */
+  sessionOf?(key: string): string | null;
 }
 
 export const PROCESS_OPS: SupervisorOps = {
@@ -52,11 +70,21 @@ export const PROCESS_OPS: SupervisorOps = {
   spawn: spawnDetachedWorker,
   isAlive: (pid) => isProcessAlive(pid),
   signal: (pgid, signal) => killProcessGroup(pgid, signal),
+  sessionOf: (key) => findSessionIdByTitle(unitSessionTitles(key)),
 };
+
+export interface SupervisorOptions {
+  /**
+   * Started only to deliver queued messages: units without a queued message keep their state
+   * and are never launched, so a restart cannot rerun a stopped pool.
+   */
+  redeliverOnly?: boolean;
+}
 
 /**
  * Owns one pool: schedules unit workers onto lanes, watches them through exit files and pids,
- * and writes per-unit state so a restarted supervisor can adopt live workers.
+ * and writes per-unit state so a restarted supervisor can adopt live workers. It also delivers
+ * queued messages: a message wakes its unit, and a "now" message interrupts a running one.
  */
 export class PoolSupervisor {
   private readonly units = new Map<string, UnitRecord>();
@@ -72,6 +100,7 @@ export class PoolSupervisor {
     private readonly config: PoolConfig,
     private readonly ops: SupervisorOps,
     private readonly supervisorPid: number,
+    private readonly options: SupervisorOptions = {},
   ) {
     this.store = new RunStore(config.runsDir);
     this.lanes = config.lanes.map((lane) => ({
@@ -98,7 +127,6 @@ export class PoolSupervisor {
         lane.backoffUntil = saved.backoff_until;
       }
     }
-
     const open: UnitFile[] = [];
     for (const unit of units) {
       if (!unit.text.includes(this.config.marker)) continue;
@@ -140,10 +168,20 @@ export class PoolSupervisor {
       killedAt: null,
       exitCode: null,
       error: null,
+      message: null,
     };
-    const next: UnitRecord = { ...base, file, names };
+    const next: UnitRecord = { ...base, file, names, message: base.message ?? null };
     if (exitCode === 0) {
-      return { ...next, state: "done", exitCode: 0, pid: null, pgid: null, error: null };
+      this.settleMessage(key, next.message ?? null, true, null, now);
+      return {
+        ...next,
+        state: "done",
+        exitCode: 0,
+        pid: null,
+        pgid: null,
+        error: null,
+        message: null,
+      };
     }
     if (
       (next.state === "running" || next.state === "killing") &&
@@ -152,6 +190,12 @@ export class PoolSupervisor {
     ) {
       return { ...next, exitCode: null };
     }
+    if (this.options.redeliverOnly && this.pendingFor(key, now) === null) {
+      // Not part of a message restart: keep the recorded outcome untouched.
+      this.settleMessage(key, next.message ?? null, false, "worker lost before delivery", now);
+      return { ...next, message: null };
+    }
+    this.settleMessage(key, next.message ?? null, false, "worker lost before delivery", now);
     // Failed, lost or interrupted units are queued again; a re-run is an explicit retry.
     return {
       ...next,
@@ -163,6 +207,7 @@ export class PoolSupervisor {
       timeouts: next.state === "failed" ? 0 : next.timeouts,
       exitCode: null,
       error: null,
+      message: null,
     };
   }
 
@@ -173,13 +218,12 @@ export class PoolSupervisor {
       this.stop("stopped", "stop requested", now);
       return false;
     }
+    this.syncMessages(now);
     for (const unit of [...this.units.values()]) this.monitor(unit, now);
     if (this.status !== "running") return false;
     this.schedule(now);
     if (this.status !== "running") return false;
-    const open = [...this.units.values()].filter(
-      (unit) => unit.state === "queued" || unit.state === "running" || unit.state === "killing",
-    );
+    const open = [...this.units.values()].filter((unit) => this.isOpen(unit, now));
     this.persist();
     if (open.length === 0) {
       this.status = "done";
@@ -197,12 +241,107 @@ export class PoolSupervisor {
     return this.units.get(key);
   }
 
+  /** A unit keeps the loop alive while it runs, while it is queued, or while a message is due for it. */
+  private isOpen(unit: UnitRecord, now: number): boolean {
+    if (unit.state === "running" || unit.state === "killing") return true;
+    if (this.pendingFor(unit.key, now) !== null) return true;
+    return unit.state === "queued" && !this.options.redeliverOnly;
+  }
+
+  private inboxOf(key: string): string {
+    return inboxFileFor(this.config.runsDir, unitRecordId(this.config.id, key));
+  }
+
+  private pendingFor(key: string, now: number): QueuedMessage | null {
+    return nextDeliverable(readInbox(this.inboxOf(key)), now);
+  }
+
+  private sessionOf(key: string): string | null {
+    return this.ops.sessionOf?.(key) ?? null;
+  }
+
+  /** Update a unit's in-flight message once its attempt has ended. */
+  private settleMessage(
+    key: string,
+    id: string | null,
+    delivered: boolean,
+    error: string | null,
+    now: number,
+    refund = false,
+  ): void {
+    if (!id) return;
+    mutateMessage(this.inboxOf(key), id, (message) =>
+      refund ? refundAttempt(message) : settleAttempt(message, delivered, error, now),
+    );
+  }
+
+  /**
+   * Messages drive units back into the queue: a finished or failed unit with a queued message is
+   * woken for a resume, and a "now" message interrupts a running unit. A unit whose OpenCode
+   * session is unknown cannot be resumed, so its messages fail instead of rerunning the brief.
+   */
+  private syncMessages(now: number): void {
+    for (const unit of this.units.values()) {
+      const file = this.inboxOf(unit.key);
+      const messages = readInbox(file);
+      if (queuedOrder(messages).length === 0) continue;
+      const next = nextDeliverable(messages, now);
+      if (unit.state === "running") {
+        if (next?.mode === "now" && unit.error !== REDELIVER_NOW) {
+          unit.error = REDELIVER_NOW;
+          this.beginKill(unit, now);
+        }
+        continue;
+      }
+      if (unit.state === "failed" && unit.error === "aborted" && next?.mode !== "now") {
+        this.cancelQueued(file, "run was aborted");
+        continue;
+      }
+      if (unit.state !== "done" && unit.state !== "failed") continue;
+      if (unit.attempts > 0 && this.sessionOf(unit.key) === null) {
+        this.failQueued(file, "opencode session not found for this unit");
+        continue;
+      }
+      unit.state = "queued";
+      unit.lane = null;
+      unit.pid = null;
+      unit.pgid = null;
+      unit.killedAt = null;
+      unit.error = null;
+      unit.exitCode = null;
+      unit.finished = null;
+      unit.timeouts = 0;
+      unit.message = null;
+      fs.rmSync(unitPaths(this.config.poolDir, unit.key).exit, { force: true });
+      this.save(unit);
+    }
+  }
+
+  private cancelQueued(file: string, reason: string): void {
+    this.changeQueued(file, (message) => ({ ...message, status: "cancelled", last_error: reason }));
+  }
+
+  private failQueued(file: string, reason: string): void {
+    this.changeQueued(file, (message) => ({ ...message, status: "failed", last_error: reason }));
+  }
+
+  private changeQueued(file: string, change: (message: QueuedMessage) => QueuedMessage): void {
+    const all = readInbox(file);
+    let touched = false;
+    const next = all.map((message) => {
+      if (message.status !== "queued" || message.in_flight) return message;
+      touched = true;
+      return change(message);
+    });
+    if (touched) writeInbox(file, next);
+  }
+
   private monitor(unit: UnitRecord, now: number): void {
     const paths = unitPaths(this.config.poolDir, unit.key);
     if (unit.state === "killing") {
       const alive = unit.pid !== null && this.ops.isAlive(unit.pid);
       if (!alive) {
-        this.afterKill(unit);
+        this.afterKill(unit, now);
       } else if (
         unit.pgid !== null &&
         unit.killedAt !== null &&
@@ -241,7 +380,10 @@ export class PoolSupervisor {
     this.save(unit);
   }
 
-  private afterKill(unit: UnitRecord): void {
+  private afterKill(unit: UnitRecord, now: number): void {
+    const message = unit.message ?? null;
+    unit.message = null;
+    this.settleMessage(unit.key, message, false, unit.error, now, unit.error === REDELIVER_NOW);
     unit.pid = null;
     unit.pgid = null;
     unit.lane = null;
@@ -262,12 +404,17 @@ export class PoolSupervisor {
   private finish(unit: UnitRecord, exitCode: number | null, now: number): void {
     const paths = unitPaths(this.config.poolDir, unit.key);
     const tail = readTail(paths.log);
+    const message = unit.message ?? null;
+    unit.message = null;
     unit.pid = null;
     unit.pgid = null;
     if (isLimitFailure(exitCode, tail)) {
+      this.settleMessage(unit.key, message, false, null, now, true);
       this.limitHit(unit, now);
       return;
     }
+    const error = exitCode === 0 ? null : exitCode === null ? "worker lost" : `exit ${exitCode}`;
+    this.settleMessage(unit.key, message, exitCode === 0, error, now);
     unit.exitCode = exitCode;
     if (exitCode === 0) {
       unit.state = "done";
@@ -281,7 +428,7 @@ export class PoolSupervisor {
     } else {
       unit.state = "failed";
       unit.finished = now;
-      unit.error = exitCode === null ? "worker lost" : `exit ${exitCode}`;
+      unit.error = error;
     }
     this.save(unit);
   }
@@ -308,10 +455,18 @@ export class PoolSupervisor {
       }
       return;
     }
+    // Units with a queued message go first (redelivery is high priority); the rest keep key order.
     const queued = [...this.units.values()]
       .filter((unit) => unit.state === "queued")
-      .sort((a, b) => a.key.localeCompare(b.key));
-    for (const unit of queued) {
+      .map((unit) => ({ unit, pending: this.pendingFor(unit.key, now) }))
+      .filter((entry) => !this.options.redeliverOnly || entry.pending !== null)
+      .sort(
+        (a, b) =>
+          Number(b.pending !== null) - Number(a.pending !== null) ||
+          (b.pending?.priority ?? 0) - (a.pending?.priority ?? 0) ||
+          a.unit.key.localeCompare(b.unit.key),
+      );
+    for (const { unit } of queued) {
       const busy = this.busyByLane();
       const lane = pickLane(this.lanes, busy, now);
       if (!lane) return;
@@ -333,22 +488,37 @@ export class PoolSupervisor {
   private launch(unit: UnitRecord, lane: LaneState, now: number): void {
     const paths = unitPaths(this.config.poolDir, unit.key);
     try {
-      const brief = renderBrief(this.config.briefTemplate, {
-        path: unit.file,
-        name: path.basename(unit.file),
-        key: unit.key,
-      });
-      const prompt = `${brief.trim()}\n\n${sharedSection(this.config.forbid)}\n`;
-      fs.writeFileSync(paths.prompt, prompt, { mode: 0o600 });
+      const pending = this.pendingFor(unit.key, now);
+      const sessionId = pending && unit.attempts > 0 ? this.sessionOf(unit.key) : null;
+      if (pending && unit.attempts > 0 && sessionId === null) {
+        // Resume is impossible until the session is visible again; try on a later tick.
+        return;
+      }
       fs.rmSync(paths.exit, { force: true });
-      const handle = this.ops.spawn({
-        command: this.config.binary,
-        args: buildRunArgs({
+      let args: string[];
+      if (pending && sessionId) {
+        args = buildResumeArgs({ model: lane.model, sessionId, text: pending.text });
+        unit.message = pending.id;
+        mutateMessage(this.inboxOf(unit.key), pending.id, startAttempt);
+      } else {
+        const brief = renderBrief(this.config.briefTemplate, {
+          path: unit.file,
+          name: path.basename(unit.file),
+          key: unit.key,
+        });
+        const prompt = `${brief.trim()}\n\n${sharedSection(this.config.forbid)}\n`;
+        fs.writeFileSync(paths.prompt, prompt, { mode: 0o600 });
+        args = buildRunArgs({
           model: lane.model,
           agent: null,
           title: `pool ${unit.key}`,
           promptFile: paths.prompt,
-        }),
+        });
+        unit.message = null;
+      }
+      const handle = this.ops.spawn({
+        command: this.config.binary,
+        args,
         cwd: this.config.cwd,
         env: { ...process.env },
         logFile: paths.log,
@@ -364,9 +534,12 @@ export class PoolSupervisor {
       unit.error = null;
       unit.finished = null;
     } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      this.settleMessage(unit.key, unit.message ?? null, false, reason, now);
+      unit.message = null;
       unit.state = "failed";
       unit.finished = now;
-      unit.error = error instanceof Error ? error.message : String(error);
+      unit.error = reason;
     }
     this.save(unit);
   }
@@ -376,6 +549,9 @@ export class PoolSupervisor {
     this.reason = reason;
     for (const unit of this.running()) {
       if (unit.pgid !== null) this.ops.signal(unit.pgid, "SIGTERM");
+      const message = unit.message ?? null;
+      unit.message = null;
+      this.settleMessage(unit.key, message, false, reason, now, status !== "stopped");
       unit.pid = null;
       unit.pgid = null;
       unit.lane = null;
@@ -445,9 +621,10 @@ export class PoolSupervisor {
 export async function runSupervisor(
   configPath: string,
   ops: SupervisorOps = PROCESS_OPS,
+  options: SupervisorOptions = {},
 ): Promise<void> {
   const config = JSON.parse(fs.readFileSync(configPath, "utf8")) as PoolConfig;
-  const supervisor = new PoolSupervisor(config, ops, process.pid);
+  const supervisor = new PoolSupervisor(config, ops, process.pid, options);
   supervisor.load(scanUnits(config.unitsGlob));
   while (supervisor.tick()) {
     await new Promise((resolve) => setTimeout(resolve, TICK_MS));

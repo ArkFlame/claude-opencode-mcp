@@ -15,6 +15,7 @@ import {
 } from "./state.js";
 
 const SUPERVISOR_MARKER = "supervisor-entry";
+export const REDELIVER_ONLY_FLAG = "--redeliver-only";
 
 export function isSupervisorAlive(pid: number | null): boolean {
   if (pid === null || !isProcessAlive(pid)) return false;
@@ -38,7 +39,10 @@ export interface StartPoolResult {
  * Start (or adopt) the detached supervisor for a pool. A live supervisor is never duplicated:
  * the call returns its pid and leaves the running config untouched.
  */
-export function startPool(config: PoolConfig): StartPoolResult {
+export function startPool(
+  config: PoolConfig,
+  options: { redeliverOnly?: boolean } = {},
+): StartPoolResult {
   const poolDir = poolDirFor(config.runsDir, config.id);
   const prior = readPoolState(poolDir);
   if (prior?.status === "running" && isSupervisorAlive(prior.supervisor_pid)) {
@@ -57,12 +61,16 @@ export function startPool(config: PoolConfig): StartPoolResult {
   const entry = fileURLToPath(new URL("./supervisor-entry.js", import.meta.url));
   const logFd = fs.openSync(path.join(poolDir, "supervisor.log"), "a", 0o600);
   try {
-    const child = spawn(process.execPath, [entry, configFile], {
-      cwd: config.cwd,
-      env: process.env,
-      detached: true,
-      stdio: ["ignore", logFd, logFd],
-    });
+    const child = spawn(
+      process.execPath,
+      [entry, configFile, ...(options.redeliverOnly ? [REDELIVER_ONLY_FLAG] : [])],
+      {
+        cwd: config.cwd,
+        env: process.env,
+        detached: true,
+        stdio: ["ignore", logFd, logFd],
+      },
+    );
     child.on("error", () => {
       // Reported through pool_status: the supervisor never writes its pid.
     });
