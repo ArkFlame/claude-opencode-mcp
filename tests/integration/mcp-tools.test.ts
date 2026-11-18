@@ -11,6 +11,7 @@ import { createMcpServer } from "../../src/mcp/server.js";
 import { OpenCodeManager } from "../../src/opencode/manager.js";
 import { SessionRegistry } from "../../src/opencode/sessions.js";
 import { RunManager } from "../../src/runs/manager.js";
+import { createRunOwner, type RunOwner } from "../../src/runs/owner.js";
 import { type RunSettings, resolveRunSettings } from "../../src/runs/settings.js";
 import { RunStore } from "../../src/runs/store.js";
 import { createLogger } from "../../src/util/logger.js";
@@ -225,5 +226,182 @@ describe("worktree tools", () => {
     const removed = await call("remove_worktree", { name: "wt-one", base: "main", cwd: repo });
     expect(removed.isError).toBe(false);
     expect(removed.data.removed_path).toBe(true);
+  });
+});
+
+/** Two Claude sessions: each with its own MCP server and owner, sharing one runs directory. */
+describe("two Claude sessions on one runs directory", () => {
+  const SESSION_A = { CLAUDE_OPENCODE_OWNER: "session-a", CLAUDE_OPENCODE_LABEL: "lane-a" };
+  const SESSION_B = { CLAUDE_OPENCODE_OWNER: "session-b", CLAUDE_OPENCODE_LABEL: "lane-b" };
+
+  async function openSession(runsDir: string, env: Record<string, string>) {
+    const logger = createLogger({
+      file: path.join(root, `bridge-${env.CLAUDE_OPENCODE_OWNER}.log`),
+    });
+    const globalConfig = BridgeConfigSchema.parse({});
+    const base = resolveRunSettings(globalConfig, { CLAUDE_OPENCODE_RUNS_DIR: runsDir });
+    const runSettings: RunSettings = {
+      ...base,
+      binary: FAKE,
+      allowedRoots: [root],
+      idleMs: 10_000,
+    };
+    const owner: RunOwner = createRunOwner({ env, pid: process.pid, ppid: 1 });
+    const runs = new RunManager({
+      store: new RunStore(runsDir),
+      settings: runSettings,
+      logger,
+      owner,
+    });
+    const sessionServer = createMcpServer({
+      logger,
+      manager,
+      registry: new SessionRegistry(
+        path.join(root, `sessions-${env.CLAUDE_OPENCODE_OWNER}.json`),
+        logger,
+      ),
+      globalConfig,
+      env,
+      stateDir: root,
+      runs,
+      runSettings,
+    });
+    const sessionClient = new Client({ name: "claude-code", version: "0.0.0" });
+    const [serverSide, clientSide] = InMemoryTransport.createLinkedPair();
+    await sessionServer.connect(serverSide);
+    await sessionClient.connect(clientSide);
+    const callAs = async (name: string, args: Record<string, unknown> = {}) => {
+      const result = await sessionClient.callTool({ name, arguments: args });
+      return {
+        isError: result.isError === true,
+        text: (result.content as Array<{ text?: string }>)[0]?.text ?? "",
+        data: (result.structuredContent ?? {}) as Record<string, any>,
+      };
+    };
+    return {
+      owner,
+      runs,
+      callAs,
+      close: () => sessionClient.close().then(() => sessionServer.close()),
+    };
+  }
+
+  /** A run record another session wrote into the shared store; its owner pid is this live test process. */
+  function seedForeignRun(runsDir: string, id: string, status: "running" | "done") {
+    const store = new RunStore(runsDir);
+    const now = Date.now();
+    store.save({
+      id,
+      name: "foreign-task",
+      status,
+      cwd: workdir,
+      branch: null,
+      agent: null,
+      model: "opencode-go/hy4-flash-free",
+      model_note: null,
+      allow_shared_cwd: true,
+      attempts: 1,
+      owner_pid: process.pid,
+      owner_id: "session-b",
+      owner_label: "lane-b",
+      pid: null,
+      pgid: null,
+      created: now,
+      started: now,
+      finished: status === "done" ? now : null,
+      last_activity: now,
+      exit_code: null,
+      signal: null,
+      final_text: null,
+      final_truncated: false,
+      last_line: null,
+      error: null,
+      prompt_file: path.join(runsDir, `${id}.prompt.md`),
+      log_file: path.join(runsDir, `${id}.log`),
+    });
+  }
+
+  it("hides the other session's runs by default and shows them with scope all", async () => {
+    const runsDir = path.join(root, "shared-runs");
+    seedForeignRun(runsDir, "foreign-run-1", "running");
+    const a = await openSession(runsDir, SESSION_A);
+    try {
+      const mine = await a.callAs("list_runs");
+      expect(mine.data.runs.map((row: { run_id: string }) => row.run_id)).not.toContain(
+        "foreign-run-1",
+      );
+
+      const all = await a.callAs("list_runs", { scope: "all" });
+      const foreign = all.data.runs.find(
+        (row: { run_id: string }) => row.run_id === "foreign-run-1",
+      );
+      expect(foreign).toMatchObject({ owner_label: "lane-b", mine: false, foreign: true });
+      expect(all.data.owners).toEqual(
+        expect.arrayContaining([expect.objectContaining({ label: "lane-b", runs: 1, running: 1 })]),
+      );
+    } finally {
+      await a.close();
+    }
+  });
+
+  it("refuses abort_run on another session's run and names it, and allows it with force", async () => {
+    const runsDir = path.join(root, "shared-runs-abort");
+    seedForeignRun(runsDir, "foreign-run-2", "running");
+    const a = await openSession(runsDir, SESSION_A);
+    try {
+      const refused = await a.callAs("abort_run", { run_id: "foreign-run-2" });
+      expect(refused.isError).toBe(true);
+      expect(refused.text).toContain("lane-b");
+      expect(refused.text).toContain("force: true");
+      expect(new RunStore(runsDir).get("foreign-run-2")?.status).toBe("running");
+
+      const forced = await a.callAs("abort_run", { run_id: "foreign-run-2", force: true });
+      expect(forced.isError).toBe(false);
+      expect(new RunStore(runsDir).get("foreign-run-2")?.status).toBe("aborted");
+    } finally {
+      await a.close();
+    }
+  });
+
+  it("reads another session's run with get_run and flags it as foreign", async () => {
+    const runsDir = path.join(root, "shared-runs-read");
+    seedForeignRun(runsDir, "foreign-run-3", "done");
+    const a = await openSession(runsDir, SESSION_A);
+    try {
+      const read = await a.callAs("get_run", { run_id: "foreign-run-3" });
+      expect(read.isError).toBe(false);
+      expect(read.data).toMatchObject({ foreign: true, owner_label: "lane-b" });
+    } finally {
+      await a.close();
+    }
+  });
+
+  it("abort_all from one session leaves the other session's live run alone", async () => {
+    const runsDir = path.join(root, "shared-runs-all");
+    seedForeignRun(runsDir, "foreign-run-4", "running");
+    const a = await openSession(runsDir, SESSION_A);
+    try {
+      const result = await a.callAs("abort_all");
+      expect(result.isError).toBe(false);
+      expect(new RunStore(runsDir).get("foreign-run-4")?.status).toBe("running");
+      const refusedAll = await a.callAs("abort_all", { scope: "all" });
+      expect(refusedAll.isError).toBe(true);
+    } finally {
+      await a.close();
+    }
+  });
+
+  it("whoami reports this session and counts runs of mine and others", async () => {
+    const runsDir = path.join(root, "shared-runs-who");
+    seedForeignRun(runsDir, "foreign-run-5", "done");
+    const a = await openSession(runsDir, SESSION_A);
+    try {
+      const who = await a.callAs("whoami");
+      expect(who.data.owner).toMatchObject({ id: "session-a", label: "lane-a" });
+      expect(who.data.runs).toMatchObject({ mine: 0, others: 1 });
+      expect(who.data.runs_dir).toBe(runsDir);
+    } finally {
+      await a.close();
+    }
   });
 });
