@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { RunManager } from "../../src/runs/manager.js";
+import { RunManager, slotsView } from "../../src/runs/manager.js";
 import { type RunRecord, RunStore } from "../../src/runs/store.js";
 import { createLogger } from "../../src/util/logger.js";
 
@@ -113,6 +113,46 @@ describe("reaper clocks", () => {
     );
     expect(manager.reapStale()).toBe(0);
     expect(store.get("sibling-1")?.status).toBe("queued");
+  });
+});
+
+describe("slot accounting", () => {
+  it("frees the slot of a running record whose process is gone", () => {
+    const { store, manager } = setup();
+    store.save(
+      baseRecord(manager, {
+        id: "dead-1",
+        status: "running",
+        pid: 2_147_483_646,
+        pgid: 2_147_483_646,
+        started: Date.now(),
+      }),
+    );
+    const records = manager.reconcile();
+    expect(records.find((entry) => entry.id === "dead-1")?.status).toBe("stale");
+    expect(slotsView(records, 0, { maxParallel: 10, maxParallelSource: "default" }).running).toBe(
+      0,
+    );
+  });
+
+  it("keeps a running record whose spawn is still being recorded and owner is alive", () => {
+    const { store, manager } = setup();
+    store.save(baseRecord(manager, { id: "starting-1", status: "running", pid: null, pgid: null }));
+    expect(manager.reconcile().find((entry) => entry.id === "starting-1")?.status).toBe("running");
+  });
+
+  it("reports max and its source next to the live count", () => {
+    const view = slotsView([], 2, {
+      maxParallel: 4,
+      maxParallelSource: "env:CLAUDE_OPENCODE_MAX_PARALLEL",
+    });
+    expect(view).toEqual({
+      running: 0,
+      queued: 2,
+      max: 4,
+      max_parallel: 4,
+      source: "env:CLAUDE_OPENCODE_MAX_PARALLEL",
+    });
   });
 });
 

@@ -10,6 +10,8 @@ export interface RunSettings {
   timeoutMs: number;
   idleMs: number;
   maxParallel: number;
+  /** Where maxParallel came from: "env:CLAUDE_OPENCODE_MAX_PARALLEL", "config" or "default". */
+  maxParallelSource: string;
   retry: boolean;
   headerFile: string | null;
   /** Empty means: the parent directory of the repository (holds sibling *-wt dirs). */
@@ -28,6 +30,9 @@ function envInt(env: NodeJS.ProcessEnv, name: string, min: number, max: number):
   return value;
 }
 
+/** Concurrent runs when neither the environment nor the config file says otherwise. */
+export const DEFAULT_MAX_PARALLEL = 10;
+
 export function defaultRunsDir(env: NodeJS.ProcessEnv = process.env): string {
   const override = env.CLAUDE_OPENCODE_RUNS_DIR?.trim();
   if (override) return path.resolve(override);
@@ -44,7 +49,14 @@ export function resolveRunSettings(
   const runs = config.runs;
   const timeoutS = envInt(env, "CLAUDE_OPENCODE_TIMEOUT", 1, 86_400) ?? runs.timeout;
   const idleS = envInt(env, "CLAUDE_OPENCODE_IDLE_TIMEOUT", 1, 86_400) ?? runs.idleTimeout;
-  const maxParallel = envInt(env, "CLAUDE_OPENCODE_MAX_PARALLEL", 1, 64) ?? runs.maxParallel;
+  const envMaxParallel = envInt(env, "CLAUDE_OPENCODE_MAX_PARALLEL", 1, 64);
+  const maxParallel = envMaxParallel ?? runs.maxParallel;
+  const maxParallelSource =
+    envMaxParallel !== null
+      ? "env:CLAUDE_OPENCODE_MAX_PARALLEL"
+      : maxParallel === DEFAULT_MAX_PARALLEL
+        ? "default"
+        : "config";
   const model = env.CLAUDE_OPENCODE_MODEL?.trim() || runs.model || DEFAULT_RUN_MODEL;
   const headerRaw = env.CLAUDE_OPENCODE_BRIEF_HEADER?.trim() || runs.briefHeaderFile;
   const rootsRaw = env.CLAUDE_OPENCODE_ALLOWED_ROOTS?.trim();
@@ -60,6 +72,7 @@ export function resolveRunSettings(
     timeoutMs: timeoutS * 1000,
     idleMs: idleS * 1000,
     maxParallel,
+    maxParallelSource,
     retry: runs.retry,
     headerFile: headerRaw ? path.resolve(headerRaw) : null,
     allowedRoots,

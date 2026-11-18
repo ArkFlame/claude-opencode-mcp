@@ -11,7 +11,7 @@ import {
   validateForbid,
   validateReadPaths,
 } from "../../runs/brief.js";
-import { DEFAULT_QUEUE_TTL_MS, summaryLine } from "../../runs/manager.js";
+import { DEFAULT_QUEUE_TTL_MS, slotsView, summaryLine } from "../../runs/manager.js";
 import { listModels, resolveRunModel } from "../../runs/models.js";
 import { assertModelId, assertRunName } from "../../runs/names.js";
 import { runDetail, runRow } from "../../runs/view.js";
@@ -274,9 +274,11 @@ async function delegate(
     current = ctx.runs.store.get(record.id) ?? current;
   }
 
-  const running = ctx.runs.activeCount();
-  const queued = ctx.runs.queuedCount();
-  const maxParallel = ctx.runs.maxParallel;
+  const records = ctx.runs.reconcile();
+  const slots = slotsView(records, ctx.runs.queuedCount(), ctx.runSettings);
+  const running = slots.running;
+  const queued = slots.queued;
+  const maxParallel = slots.max;
   const position = ctx.runs.queuePosition(record.id);
   const refillHint =
     position > 0
@@ -309,9 +311,9 @@ async function delegate(
     read_paths: readPaths,
     waited_out: waitedOut,
     result: current.status === "running" || current.status === "queued" ? null : runDetail(current),
-    slots: { running, queued, max_parallel: maxParallel },
+    slots,
     refill_hint: refillHint,
-    summary_line: summaryLine(ctx.runs.store.list(), maxParallel),
+    summary_line: summaryLine(records, maxParallel),
     row: runRow(current),
   });
 }

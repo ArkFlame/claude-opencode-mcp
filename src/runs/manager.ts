@@ -83,6 +83,29 @@ export function buildRunArgs(input: {
   return args;
 }
 
+/** A run occupies a slot only while its process is alive. Pool workers are checked by pid. */
+export function isLiveRun(record: RunRecord): boolean {
+  if (record.status !== "running") return false;
+  if (!record.pool) return true;
+  const pgid = record.pgid ?? record.pid;
+  return pgid !== null && isProcessAlive(pgid);
+}
+
+/** Slot view shared by delegate_task, list_runs and summary_line so they never disagree. */
+export function slotsView(
+  records: RunRecord[],
+  queued: number,
+  settings: { maxParallel: number; maxParallelSource: string },
+): { running: number; queued: number; max: number; max_parallel: number; source: string } {
+  return {
+    running: records.filter(isLiveRun).length,
+    queued,
+    max: settings.maxParallel,
+    max_parallel: settings.maxParallel,
+    source: settings.maxParallelSource,
+  };
+}
+
 export function summaryLine(records: RunRecord[], maxParallel: number): string {
   const counts: Record<string, number> = {};
   for (const record of records) counts[record.status] = (counts[record.status] ?? 0) + 1;
@@ -454,8 +477,38 @@ export class RunManager {
       this.reapRecord(record, reason, "stale");
       count += 1;
     }
+    count += this.markDeadSlots();
     if (count > 0) this.options.logger.info("reaped stale runs", { count });
     this.pump();
+    return count;
+  }
+
+  /**
+   * Live-process reconciliation: a running record whose process is gone (or never existed) frees
+   * its slot and is marked stale. Records this process is still driving and pool workers, which
+   * their supervisor owns, are left alone. Returns the fresh record list.
+   */
+  reconcile(): RunRecord[] {
+    this.markDeadSlots();
+    return this.store.list();
+  }
+
+  /** Mark running records without a live process stale. Returns how many changed. */
+  private markDeadSlots(): number {
+    let count = 0;
+    for (const record of this.store.list()) {
+      if (record.status !== "running" || this.active.has(record.id) || record.pool) continue;
+      const pgid = record.pgid ?? record.pid;
+      if (pgid === null) {
+        // Spawn not recorded yet: a live owner may still be starting it.
+        if (isProcessAlive(record.owner_pid)) continue;
+      } else if (isProcessAlive(pgid) && looksLikeOpencode(pgid)) {
+        continue;
+      }
+      this.reapRecord(record, "process exited without a result; slot freed", "stale");
+      count += 1;
+    }
+    if (count > 0) this.options.logger.info("reconciled dead run slots", { count });
     return count;
   }
 
@@ -507,6 +560,7 @@ export class RunManager {
     const deadline = Date.now() + seconds * 1000;
     for (;;) {
       // A run of another session may have finished since the last check, freeing a cwd.
+      this.reconcile();
       this.pump();
       const snapshot = this.collect(ids);
       const done = snapshot.finished.length > 0 || snapshot.pending.length === 0;

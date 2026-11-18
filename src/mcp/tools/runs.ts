@@ -5,7 +5,7 @@ import { z } from "zod";
 import { BridgeError } from "../../errors.js";
 import { requestAllPoolStops, requestUnitAbort } from "../../pool/launch.js";
 import { countQueued, inboxFileFor } from "../../queue/inbox.js";
-import { summaryLine } from "../../runs/manager.js";
+import { slotsView, summaryLine } from "../../runs/manager.js";
 import { listModels } from "../../runs/models.js";
 import { assertRunName } from "../../runs/names.js";
 import {
@@ -88,7 +88,7 @@ export function registerRunTools(server: McpServer, ctx: AppContext): void {
         const now = Date.now();
         const scope = args.scope ?? "mine";
         const me = ctx.runs.owner;
-        const all = filterByScope(ctx.runs.store.list(), scope, me);
+        const all = filterByScope(ctx.runs.reconcile(), scope, me);
         const rows = all
           .filter((record) => !args.status || record.status === args.status)
           .slice(0, args.limit ?? 50)
@@ -99,11 +99,7 @@ export function registerRunTools(server: McpServer, ctx: AppContext): void {
         return {
           scope,
           summary_line: summaryLine(all, ctx.runs.maxParallel),
-          slots: {
-            running: ctx.runs.activeCount(),
-            queued: ctx.runs.queuedCount(),
-            max_parallel: ctx.runs.maxParallel,
-          },
+          slots: slotsView(ctx.runs.store.list(), ctx.runs.queuedCount(), ctx.runSettings),
           ...(scope === "all" ? { owners: summarizeOwners(all, me) } : {}),
           runs: rows,
         };
@@ -162,7 +158,7 @@ export function registerRunTools(server: McpServer, ctx: AppContext): void {
         return {
           run_id: settled.id,
           status: settled.status,
-          summary_line: summaryLine(ctx.runs.store.list(), ctx.runs.maxParallel),
+          summary_line: summaryLine(ctx.runs.reconcile(), ctx.runs.maxParallel),
         };
       }),
   );
@@ -201,7 +197,7 @@ export function registerRunTools(server: McpServer, ctx: AppContext): void {
           ...result,
           scope,
           pools_stopped: poolsStopped,
-          summary_line: summaryLine(ctx.runs.store.list(), ctx.runs.maxParallel),
+          summary_line: summaryLine(ctx.runs.reconcile(), ctx.runs.maxParallel),
         };
       }),
   );
@@ -245,11 +241,7 @@ export function registerRunTools(server: McpServer, ctx: AppContext): void {
           pending: waited.pending,
           unknown: waited.unknown,
           timed_out: waited.timed_out,
-          slots: {
-            running: ctx.runs.activeCount(),
-            queued: ctx.runs.queuedCount(),
-            max_parallel: ctx.runs.maxParallel,
-          },
+          slots: slotsView(ctx.runs.reconcile(), ctx.runs.queuedCount(), ctx.runSettings),
           refill_hint:
             waited.finished.length > 0
               ? "Start the next queued task now, then wait again."
